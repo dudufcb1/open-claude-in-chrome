@@ -87,11 +87,28 @@ async function ensureTabGroup(createIfEmpty) {
 
   if (!createIfEmpty) return;
 
-  // Create a new window with a tab, group it
-  const win = await chrome.windows.create({ focused: true, url: "about:blank" });
-  const tab = win.tabs[0];
+  // Evita acumulacion infinita de grupos huerfanos de sesiones viejas. Solo si ya
+  // hay mas de MAX_MCP_GROUPS grupos nuestros se cierran TODOS antes de abrir el
+  // nuevo. El umbral evita reventar grupos donde otra instancia siga trabajando.
+  const MAX_MCP_GROUPS = 5;
+  try {
+    const ours = (await chrome.tabGroups.query({}))
+      .filter((g) => g.title === "MCP" || g.title === "Chrome");
+    if (ours.length > MAX_MCP_GROUPS) {
+      for (const g of ours) {
+        const gtabs = await chrome.tabs.query({ groupId: g.id });
+        const ids = gtabs.map((t) => t.id).filter((id) => id != null);
+        if (ids.length) { try { await chrome.tabs.remove(ids); } catch {} }
+      }
+      tabGroupId = null;
+      tabGroupTabs.clear();
+    }
+  } catch {}
+
+  // Create a tab in the current window, group it
+  const tab = await chrome.tabs.create({ url: "about:blank", active: true });
   const groupId = await chrome.tabs.group({ tabIds: [tab.id] });
-  await chrome.tabGroups.update(groupId, { title: "MCP", color: "blue" });
+  await chrome.tabGroups.update(groupId, { title: "Chrome", color: "blue" });
   tabGroupId = groupId;
   tabGroupTabs = new Set([tab.id]);
 }
@@ -127,7 +144,7 @@ async function isInGroup(tabId) {
       if (tabGroupId === null) {
         try {
           const group = await chrome.tabGroups.get(tab.groupId);
-          if (group.title === "MCP") {
+          if (group.title === "Chrome") {
             tabGroupId = group.id;
             const groupTabs = await chrome.tabs.query({ groupId: tabGroupId });
             tabGroupTabs = new Set(groupTabs.map((t) => t.id));
@@ -149,11 +166,16 @@ async function ensureAttached(tabId) {
   attachedTabs.set(tabId, { enabledDomains: new Set() });
   // Force devicePixelRatio to 1 so screenshots match CSS coordinate space.
   // Without this, Retina displays produce 2x screenshots and all coordinates are wrong.
+  // RETINA_OVERRIDE: set to true on HiDPI/Retina displays where screenshots come out
+  // at 2x resolution. When false (default), only deviceScaleFactor is forced to 1
+  // without altering the viewport dimensions -- this preserves the real viewport height
+  // and prevents layout issues (buttons pushed off-screen, scroll not working, etc).
+  const RETINA_OVERRIDE = false;
   const tab = await chrome.tabs.get(tabId);
   const win = await chrome.windows.get(tab.windowId);
   await chrome.debugger.sendCommand({ tabId }, "Emulation.setDeviceMetricsOverride", {
-    width: win.width,
-    height: win.height,
+    width: RETINA_OVERRIDE ? win.width : 0,
+    height: RETINA_OVERRIDE ? win.height : 0,
     deviceScaleFactor: 1,
     mobile: false,
   });
@@ -314,13 +336,19 @@ async function resolveRefToCoordinates(tabId, ref) {
 const MAX_SCREENSHOT_WIDTH = 1280;
 const MAX_SCREENSHOT_HEIGHT = 800;
 
-async function takeScreenshot(tabId) {
+async function takeScreenshot(tabId, lossless = false) {
   await ensureAttached(tabId);
 
   // With deviceScaleFactor: 1 set in ensureAttached, screenshots are captured
   // at CSS pixel dimensions (e.g., 1080x746), matching the coordinate space
   // used by Input.dispatchMouseEvent. No scaling tricks needed.
-  const result = await cdp(tabId, "Page.captureScreenshot", {
+  // lossless: PNG at full quality, meant to be persisted to disk by the
+  // client (e.g. building a user manual); skips the size-reduction fallback.
+  const result = await cdp(tabId, "Page.captureScreenshot", lossless ? {
+    format: "png",
+    optimizeForSpeed: true,
+    captureBeyondViewport: false,
+  } : {
     format: "jpeg",
     quality: 55,
     optimizeForSpeed: true,
@@ -329,7 +357,7 @@ async function takeScreenshot(tabId) {
   let base64 = result.data;
 
   // If still too large (>500KB base64 ≈ ~375KB binary), reduce quality further
-  if (base64.length > 500000) {
+  if (!lossless && base64.length > 500000) {
     const smaller = await cdp(tabId, "Page.captureScreenshot", {
       format: "jpeg",
       quality: 30,
@@ -347,7 +375,7 @@ async function takeScreenshot(tabId) {
     screenshotStore.delete(keys.shift());
   }
 
-  return { base64, imageId };
+  return { base64, imageId, format: lossless ? "png" : "jpeg" };
 }
 
 // --- Mouse helpers ---
@@ -452,6 +480,126 @@ const toolHandlers = {
     return { content: [{ type: "text", text }] };
   },
 
+  async keyword_planner(args) {
+    const { words, tabId } = args;
+    if (!Array.isArray(words) || !words.length) return { content: [{ type: "text", text: "keyword_planner: 'words' debe ser un array no vacio." }] };
+    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+
+    const ev = async (expr) => {
+      await ensureAttached(tabId);
+      const r = await cdp(tabId, "Runtime.evaluate", { expression: expr, returnByValue: true });
+      return r?.result?.value;
+    };
+    const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
+
+    // Cuenta PC MARKET (503-017-6339): URL directa, salta el selector de cuenta.
+    const KP_URL = "https://ads.google.com/aw/keywordplanner/home?ocid=90789702&__c=2463566998&__e=5030176339&authuser=0";
+    // KP (Google Ads SPA) NO renderiza la tabla del plan si la pestaña esta en
+    // segundo plano (throttling de tabs inactivas). Hay que ACTIVARLA y enfocar su
+    // ventana, si no el extractor lee filas vacias ("no renderizo filas").
+    await chrome.tabs.update(tabId, { url: KP_URL, active: true });
+    try { const _t = await chrome.tabs.get(tabId); await chrome.windows.update(_t.windowId, { focused: true }); } catch (e) {}
+    await new Promise((resolve) => {
+      const listener = (id, info) => { if (id === tabId && info.status === "complete") { chrome.tabs.onUpdated.removeListener(listener); resolve(); } };
+      chrome.tabs.onUpdated.addListener(listener);
+      setTimeout(() => { chrome.tabs.onUpdated.removeListener(listener); resolve(); }, 10000);
+    });
+
+    // Snippets resilientes: click por texto, escritura por setter nativo, extraccion por roles.
+    const clickByText = (needle, exact) =>
+      "(()=>{const needle=" + JSON.stringify(needle) + ";const exact=" + (exact ? "true" : "false") + ";" +
+      "for(const el of document.querySelectorAll('*')){" +
+      "const own=Array.from(el.childNodes).filter(n=>n.nodeType===3).map(n=>n.textContent).join('').trim();" +
+      "const m=exact?own===needle:own.includes(needle);if(!m)continue;" +
+      "const t=el.closest('[role=button],button,a')||el;const r=t.getBoundingClientRect();" +
+      "const cx=r.left+r.width/2,cy=r.top+r.height/2;" +
+      "for(const e of ['mousedown','mouseup','click'])t.dispatchEvent(new MouseEvent(e,{bubbles:true,cancelable:true,view:window,clientX:cx,clientY:cy}));" +
+      "try{t.click()}catch(_){}return true}return false})()";
+    const setKeywords = (ws) =>
+      "(()=>{const ta=document.querySelector('textarea');if(!ta)return false;ta.focus();" +
+      "const s=Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype,'value').set;" +
+      "s.call(ta," + JSON.stringify(ws.join(", ")) + ");" +
+      "ta.dispatchEvent(new Event('input',{bubbles:true}));ta.dispatchEvent(new Event('change',{bubbles:true}));return true})()";
+    const hasText = (needle) => "document.body.innerText.toLowerCase().includes(" + JSON.stringify(needle.toLowerCase()) + ")";
+    const extractRows =
+      "(()=>{const out=[];for(const r of document.querySelectorAll('[role=row]')){" +
+      "const cells=[...r.querySelectorAll('[role=gridcell],[role=cell],td')];" +
+      "const c=cells.map(x=>(x.getAttribute('title')||x.innerText||'').trim().replace(/\\s+/g,' '));" +
+      "if(c.length<5)continue;const k=c[0];if(!k||/palabra clave/i.test(k))continue;" +
+      "out.push({keyword:k,volumen_mensual:c[1]||'',cambio_3m:c[2]||'',cambio_interanual:c[3]||'',competencia:c[4]||'',pct_impresiones:c[5]||'',puja_baja:c[6]||'',puja_alta:c[7]||''})}return out})()";
+
+    // Abrir "Conozca el volumen de busqueda" (volumen de cada keyword exacta)
+    let opened = false;
+    for (let i = 0; i < 20 && !opened; i++) {
+      if (await ev(hasText("Conozca el volumen"))) opened = await ev(clickByText("Conozca el volumen", false));
+      if (!opened) await sleep(1500);
+    }
+    if (!opened) return { content: [{ type: "text", text: "keyword_planner: no se pudo abrir la tarjeta (¿sesion/cuenta? revisa login)." }] };
+
+    // Escribir keywords (separadas por coma)
+    let wrote = false;
+    for (let i = 0; i < 12 && !wrote; i++) { wrote = await ev(setKeywords(words)); if (!wrote) await sleep(1000); }
+
+    // Submit ("Inicio"). KP navega a la vista de plan (historical) con un splash que
+    // puede tardar varios segundos; por eso se sondea LARGO hasta que rendericen las
+    // filas reales (antes, 25x1.5s se quedaba corto y devolvia "no encontrada" en todo).
+    try { await chrome.tabs.update(tabId, { active: true }); } catch (e) {}
+    await ev(clickByText("Inicio", true));
+    await sleep(2000);
+    let rows = [];
+    // Tope ~40s de sondeo para NO rebasar el timeout de 60s del MCP. Si KP esta lento
+    // y no alcanza, devuelve el mensaje de abajo y se reintenta (el plan ya queda
+    // cargado, asi que el reintento responde al instante).
+    for (let i = 0; i < 18; i++) { rows = (await ev(extractRows)) || []; if (rows.length) break; await sleep(2000); }
+
+    // Distinguir "KP lento / no cargo" de "keyword sin volumen": si NO hay ninguna
+    // fila, el problema es de carga, no que las keywords no existan.
+    if (!rows.length) return { content: [{ type: "text", text: "keyword_planner: el plan no renderizo filas a tiempo (KP lento). Los datos quedan en el plan guardado; reintenta la consulta." }] };
+
+    // Match tolerante a acentos (KP a veces normaliza 'mexico'/'méxico').
+    const norm = (s) => (s || "").toString().toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "").trim();
+    const byKw = {};
+    for (const r of rows) byKw[norm(r.keyword)] = r;
+    const result = words.map((w) => byKw[norm(w)] || { keyword: w, error: "no encontrada" });
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  },
+
+  async download_url(args) {
+    const { url, filename, tabId } = args;
+    if (!url) return { content: [{ type: "text", text: "download_url: falta 'url'." }] };
+    if (!tabId) return { content: [{ type: "text", text: "download_url: falta 'tabId' (el tab cuya sesion se usa para bajar la URL)." }] };
+    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} no esta en el grupo MCP.` }] };
+
+    const dir = args.downloadDir || "/home/edu/Descargas";
+    const fn = (filename || "download").replace(/['"\\]/g, "");
+    await ensureAttached(tabId);
+
+    // Forzar carpeta de descarga SIN dialogo del SO, independiente de la config del perfil.
+    let forced = false;
+    try { await cdp(tabId, "Browser.setDownloadBehavior", { behavior: "allow", downloadPath: dir, eventsEnabled: false }); forced = true; }
+    catch (e1) {
+      try { await cdp(tabId, "Page.setDownloadBehavior", { behavior: "allow", downloadPath: dir }); forced = true; }
+      catch (e2) { return { content: [{ type: "text", text: "No se pudo forzar download behavior: " + String(e2) }] }; }
+    }
+
+    // Descargar via fetch->blob->click en el contexto del tab (hereda cookies de la sesion).
+    const expr =
+      "(function(){var u=" + JSON.stringify(url) + ";var fn=" + JSON.stringify(fn) + ";" +
+      "window.__dlDone=false;window.__dlErr='';window.__dlSize=0;" +
+      "fetch(u).then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.blob();}).then(function(b){" +
+      "window.__dlSize=b.size;var bu=URL.createObjectURL(b);var a=document.createElement('a');a.href=bu;a.download=fn;" +
+      "document.body.appendChild(a);a.click();setTimeout(function(){URL.revokeObjectURL(bu);a.remove();},8000);window.__dlDone=true;" +
+      "}).catch(function(e){window.__dlErr=String(e);window.__dlDone=true;});return 'started';})()";
+    await cdp(tabId, "Runtime.evaluate", { expression: expr });
+    await new Promise((r) => setTimeout(r, 3500));
+    let info = "";
+    try {
+      const chk = await cdp(tabId, "Runtime.evaluate", { expression: "JSON.stringify({done:window.__dlDone,err:window.__dlErr,size:window.__dlSize})", returnByValue: true });
+      info = (chk && chk.result && chk.result.value) || "";
+    } catch (e) { info = "(no se pudo leer estado)"; }
+    return { content: [{ type: "text", text: "download_url -> carpeta=" + dir + " filename=" + fn + " forced=" + forced + " | " + info }] };
+  },
+
   async computer(args) {
     const { action, tabId } = args;
     if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
@@ -468,7 +616,7 @@ const toolHandlers = {
 
     switch (action) {
       case "screenshot": {
-        const { base64, imageId } = await takeScreenshot(tabId);
+        const { base64, imageId, format } = await takeScreenshot(tabId, !!args.lossless);
         // Get viewport dimensions for the response message
         let dims = "";
         try {
@@ -479,8 +627,8 @@ const toolHandlers = {
         } catch {}
         return {
           content: [
-            { type: "text", text: `Successfully captured screenshot (${dims}, jpeg) - ID: ${imageId}` },
-            { type: "image", data: base64, mimeType: "image/jpeg" },
+            { type: "text", text: `Successfully captured screenshot (${dims}, ${format}) - ID: ${imageId}` },
+            { type: "image", data: base64, mimeType: `image/${format}` },
           ],
         };
       }
@@ -489,6 +637,46 @@ const toolHandlers = {
         if (!coordinate) return { content: [{ type: "text", text: "coordinate is required for left_click" }] };
         await mouseClick(tabId, coordinate[0], coordinate[1], { modifiers });
         return { content: [{ type: "text", text: `Clicked at (${coordinate[0]}, ${coordinate[1]})` }] };
+      }
+
+      case "js_click": {
+        if (!coordinate) return { content: [{ type: "text", text: "coordinate is required for js_click" }] };
+        await ensureAttached(tabId);
+        const [x, y] = coordinate;
+        const expression = `
+          (() => {
+            const el = document.elementFromPoint(${x}, ${y});
+            if (!el) return { ok: false, error: 'no element at (' + ${x} + ',' + ${y} + ')' };
+            const desc = (el.tagName || '') + (el.id ? '#' + el.id : '') + (el.className && typeof el.className === 'string' ? '.' + el.className.trim().split(/\\s+/).join('.') : '');
+            // Walk up DOM looking for clickable ancestor (button, a, [role=button], [onclick])
+            let target = el;
+            let depth = 0;
+            while (target && depth < 6) {
+              const t = target.tagName;
+              if (t === 'BUTTON' || t === 'A' || target.getAttribute('role') === 'button' || target.onclick || target.getAttribute('onclick')) break;
+              target = target.parentElement;
+              depth++;
+            }
+            if (!target) target = el;
+            // Dispatch full mouse event sequence + click
+            const rect = target.getBoundingClientRect();
+            const cx = rect.left + rect.width / 2;
+            const cy = rect.top + rect.height / 2;
+            const mkEvent = (type) => new MouseEvent(type, { view: window, bubbles: true, cancelable: true, button: 0, clientX: cx, clientY: cy });
+            target.dispatchEvent(mkEvent('mousedown'));
+            target.dispatchEvent(mkEvent('mouseup'));
+            target.dispatchEvent(mkEvent('click'));
+            // Also call .click() in case the framework uses pointer events / Vue/React synthetic listeners
+            try { target.click(); } catch(e) {}
+            return { ok: true, target: (target.tagName || '') + (target.id ? '#' + target.id : '') + (target.className && typeof target.className === 'string' ? '.' + target.className.trim().split(/\\s+/).slice(0,3).join('.') : ''), elementAtPoint: desc };
+          })()
+        `;
+        const result = await cdp(tabId, "Runtime.evaluate", { expression, returnByValue: true });
+        const value = result?.result?.value;
+        if (value && value.ok) {
+          return { content: [{ type: "text", text: `JS-clicked at (${x}, ${y}) target=<${value.target}> elementAtPoint=<${value.elementAtPoint}>` }] };
+        }
+        return { content: [{ type: "text", text: `JS click failed: ${value?.error || result?.exceptionDetails?.text || 'unknown'}` }] };
       }
 
       case "right_click": {
@@ -825,6 +1013,19 @@ const toolHandlers = {
     return { content: [{ type: "text", text: `Network requests (${reqs.length}):\n${text}` }] };
   },
 
+  async tabs_activate(args) {
+    const { tabId } = args;
+    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+
+    await chrome.tabs.update(tabId, { active: true });
+    const tab = await chrome.tabs.get(tabId);
+    if (tab.groupId > -1) {
+      try { await chrome.tabGroups.update(tab.groupId, { collapsed: false }); } catch (e) {}
+    }
+    try { await chrome.windows.update(tab.windowId, { focused: true }); } catch (e) {}
+    return { content: [{ type: "text", text: `Tab ${tabId} activated and brought to front` }] };
+  },
+
   async resize_window(args) {
     const { width, height, tabId } = args;
     if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
@@ -923,7 +1124,7 @@ async function handleToolRequest(id, tool, args) {
 // Recover MCP tab group state after service worker restart
 async function recoverTabGroupState() {
   try {
-    const groups = await chrome.tabGroups.query({ title: "MCP" });
+    const groups = await chrome.tabGroups.query({ title: "Chrome" });
     if (groups.length > 0) {
       tabGroupId = groups[0].id;
       const tabs = await chrome.tabs.query({ groupId: tabGroupId });

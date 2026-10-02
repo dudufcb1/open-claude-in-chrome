@@ -21,6 +21,8 @@ import { z } from "zod";
 const DEFAULT_PORT = 18765;
 
 function getPort() {
+  // Aislamiento por instancia (patron n8n): cada instancia su propio puerto via env.
+  if (process.env.OCIC_PORT) return parseInt(process.env.OCIC_PORT, 10);
   const configPath = path.join(os.homedir(), ".config", "open-claude-in-chrome", "config.json");
   try {
     const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
@@ -427,6 +429,39 @@ function mixedResult(parts) {
   return { content: parts };
 }
 
+// Saves the image content of a tool result to disk when a path is given.
+// Expands ~, creates parent dirs, and appends a text note with the final path.
+function saveImageResult(result, savePath) {
+  if (!savePath || !result || !Array.isArray(result.content)) return result;
+  const image = result.content.find((c) => c.type === "image" && c.data);
+  if (!image) return result;
+  try {
+    let target = savePath;
+    if (target.startsWith("~")) target = path.join(os.homedir(), target.slice(1));
+    if (!path.isAbsolute(target)) target = path.resolve(process.cwd(), target);
+    // If a directory (existing or trailing slash) or no image extension, build a filename.
+    const looksLikeDir =
+      target.endsWith("/") ||
+      (fs.existsSync(target) && fs.statSync(target).isDirectory());
+    if (looksLikeDir || !/\.(png|jpg|jpeg|webp)$/i.test(target)) {
+      const ext = (image.mimeType || "image/png").split("/")[1] || "png";
+      target = path.join(target, `screenshot-${Date.now()}.${ext}`);
+    }
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, Buffer.from(image.data, "base64"));
+    return {
+      content: [...result.content, { type: "text", text: `Saved screenshot to ${target}` }],
+    };
+  } catch (err) {
+    return {
+      content: [
+        ...result.content,
+        { type: "text", text: `Failed to save screenshot: ${err.message}` },
+      ],
+    };
+  }
+}
+
 async function callTool(toolName, args) {
   try {
     const result = await sendToExtension(toolName, args);
@@ -494,16 +529,40 @@ server.tool(
   async (args) => callTool("navigate", args)
 );
 
+// 3b. keyword_planner (custom — devactivo)
+server.tool(
+  "keyword_planner",
+  "Extrae volumen de busqueda mensual, competencia y CPC del Google Keyword Planner (cuenta PC MARKET) para una lista de keywords exactas. Abre el KP, ingresa las keywords, y devuelve los datos estructurados como JSON. No descarga archivos (la descarga abre un dialogo del SO que bloquea). Interaccion resiliente: click por texto + extraccion por roles de tabla. Si falla, cae a las tools primitivas (navigate/computer/javascript) para resolverlo manualmente.",
+  {
+    words: z.array(z.string()).min(1).describe("Lista de keywords exactas a consultar (ej. ['facturapi','seguridad privada para empresas'])."),
+    tabId: z.number().describe("Tab ID donde ejecutar. Debe estar en el grupo MCP. Usa tabs_context_mcp primero si no tienes uno."),
+  },
+  async (args) => callTool("keyword_planner", args)
+);
+
+// 3c. download_url (custom — devactivo): descarga sin dialogo del SO
+server.tool(
+  "download_url",
+  "Descarga un archivo (imagen, PDF, export, etc.) a una carpeta local SIN abrir el dialogo del SO. Fuerza la carpeta por CDP (Browser.setDownloadBehavior), independiente de la config del perfil, y baja la URL via fetch->blob en el tab indicado, asi que usa las cookies de ESA sesion (sirve para URLs autenticadas: imagenes de ChatGPT, exports de GSC). Requiere un tabId logueado en el sitio de la URL.",
+  {
+    url: z.string().describe("URL del archivo a descargar. Se baja con la sesion del tabId dado (cookies)."),
+    tabId: z.number().describe("Tab ID (del grupo MCP) cuya sesion se usa para bajar la URL. Debe estar logueado en el sitio."),
+    filename: z.string().optional().describe("Nombre del archivo final (ej. 'devactivo-img.png'). Si se omite usa 'download'."),
+    downloadDir: z.string().optional().describe("Carpeta absoluta destino. Default: /home/edu/Descargas."),
+  },
+  async (args) => callTool("download_url", args)
+);
+
 // 4. computer
 server.tool(
   "computer",
   "Use a mouse and keyboard to interact with a web browser, and take screenshots. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.\n* Whenever you intend to click on an element like an icon, you should consult a screenshot to determine the coordinates of the element before moving the cursor.\n* If you tried clicking on a program or link but it failed to load, even after waiting, try adjusting your click location so that the tip of the cursor visually falls on the element that you want to click.\n* Make sure to click any buttons, links, icons, etc with the cursor tip in the center of the element. Don't click boxes on their edges unless asked.",
   {
     action: z.enum([
-      "left_click", "right_click", "double_click", "triple_click",
+      "left_click", "js_click", "right_click", "double_click", "triple_click",
       "type", "screenshot", "wait", "scroll", "key",
       "left_click_drag", "zoom", "scroll_to", "hover"
-    ]).describe('The action to perform:\n* `left_click`: Click the left mouse button at the specified coordinates.\n* `right_click`: Click the right mouse button at the specified coordinates to open context menus.\n* `double_click`: Double-click the left mouse button at the specified coordinates.\n* `triple_click`: Triple-click the left mouse button at the specified coordinates.\n* `type`: Type a string of text.\n* `screenshot`: Take a screenshot of the screen.\n* `wait`: Wait for a specified number of seconds.\n* `scroll`: Scroll up, down, left, or right at the specified coordinates.\n* `key`: Press a specific keyboard key.\n* `left_click_drag`: Drag from start_coordinate to coordinate.\n* `zoom`: Take a screenshot of a specific region for closer inspection.\n* `scroll_to`: Scroll an element into view using its element reference ID from read_page or find tools.\n* `hover`: Move the mouse cursor to the specified coordinates or element without clicking. Useful for revealing tooltips, dropdown menus, or triggering hover states.'),
+    ]).describe('The action to perform:\n* `left_click`: Click the left mouse button at the specified coordinates (physical CDP mouse event).\n* `js_click`: Click via JavaScript at the specified coordinates. Use this when `left_click` does not produce visible effect — typical causes are invisible overlays absorbing the click in SPA frameworks (Vue/React), `pointer-events: none` on ancestors, or elements re-rendering between mousedown and mouseup. Walks up the DOM tree to find the nearest clickable ancestor (button/a/[role=button]/[onclick]) and dispatches a full mousedown+mouseup+click sequence on it. Use as a fallback when physical clicks silently fail.\n* `right_click`: Click the right mouse button at the specified coordinates to open context menus.\n* `double_click`: Double-click the left mouse button at the specified coordinates.\n* `triple_click`: Triple-click the left mouse button at the specified coordinates.\n* `type`: Type a string of text.\n* `screenshot`: Take a screenshot of the screen.\n* `wait`: Wait for a specified number of seconds.\n* `scroll`: Scroll up, down, left, or right at the specified coordinates.\n* `key`: Press a specific keyboard key.\n* `left_click_drag`: Drag from start_coordinate to coordinate.\n* `zoom`: Take a screenshot of a specific region for closer inspection.\n* `scroll_to`: Scroll an element into view using its element reference ID from read_page or find tools.\n* `hover`: Move the mouse cursor to the specified coordinates or element without clicking. Useful for revealing tooltips, dropdown menus, or triggering hover states.'),
     tabId: z.number().describe("Tab ID to execute the action on. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
     coordinate: z.array(z.number()).min(2).max(2).optional().describe("(x, y): The x (pixels from the left edge) and y (pixels from the top edge) coordinates. Required for `left_click`, `right_click`, `double_click`, `triple_click`, and `scroll`. For `left_click_drag`, this is the end position."),
     duration: z.number().min(0).max(30).optional().describe("The number of seconds to wait. Required for `wait`. Maximum 30 seconds."),
@@ -515,8 +574,13 @@ server.tool(
     scroll_amount: z.number().min(1).max(10).optional().describe("The number of scroll wheel ticks. Optional for `scroll`, defaults to 3."),
     start_coordinate: z.array(z.number()).min(2).max(2).optional().describe("(x, y): The starting coordinates for `left_click_drag`."),
     text: z.string().optional().describe('The text to type (for `type` action) or the key(s) to press (for `key` action). For `key` action: Provide space-separated keys (e.g., "Backspace Backspace Delete"). Supports keyboard shortcuts using the platform\'s modifier key (use "cmd" on Mac, "ctrl" on Windows/Linux, e.g., "cmd+a" or "ctrl+a" for select all).'),
+    save_path: z.string().optional().describe('Optional absolute path (or directory) where the captured image should be saved on disk. Only applies to `screenshot` and `zoom` actions. If a directory or path without an image extension is given, a filename is generated automatically. Use this to persist screenshots for later use (e.g. building reports or slide decks).'),
   },
-  async (args) => callTool("computer", args)
+  async (args) => {
+    const { save_path, ...rest } = args;
+    const result = await callTool("computer", rest);
+    return saveImageResult(result, save_path);
+  }
 );
 
 // 5. find
@@ -636,6 +700,16 @@ server.tool(
     tabId: z.number().describe("Tab ID to get the window for. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
   },
   async (args) => callTool("resize_window", args)
+);
+
+// 13b. tabs_activate — bring a tab to front visually
+server.tool(
+  "tabs_activate",
+  "Bring a tab to the front visually: activates it, expands its group if collapsed, and focuses the Chrome window. Use when mixing OS clicks with CDP and you need the tab visible on screen. Does NOT change the tab's URL.",
+  {
+    tabId: z.number().describe("Tab ID to bring to front. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
+  },
+  async (args) => callTool("tabs_activate", args)
 );
 
 // 14. shortcuts_list

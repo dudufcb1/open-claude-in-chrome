@@ -11,19 +11,38 @@ import path from "node:path";
 import os from "node:os";
 
 const DEFAULT_PORT = 18765;
+const CONFIG_DIR = path.join(os.homedir(), ".config", "open-claude-in-chrome");
+const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
+const LOG_PATH = path.join(CONFIG_DIR, "host.log");
+const LOG_MAX_BYTES = 512 * 1024;
 
-function getPort() {
-  const configPath = path.join(
-    os.homedir(),
-    ".config",
-    "open-claude-in-chrome",
-    "config.json"
-  );
+// Carpeta de datos por omision de cada navegador: el perfil que arranca con ella (o sin
+// --user-data-dir) es el principal, donde viven las sesiones iniciadas de todos los dias.
+const DEFAULT_DATA_DIRS = {
+  chrome: path.join(os.homedir(), ".config", "google-chrome"),
+  chromium: path.join(os.homedir(), ".config", "chromium"),
+  brave: path.join(os.homedir(), ".config", "BraveSoftware", "Brave-Browser"),
+  edge: path.join(os.homedir(), ".config", "microsoft-edge"),
+};
+
+function readConfig() {
   try {
-    const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
-    return config.port || DEFAULT_PORT;
+    return JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
   } catch {
-    return DEFAULT_PORT;
+    return {};
+  }
+}
+
+/// Deja una linea en host.log: es lo primero que se revisa cuando un perfil "no agarra".
+function log(message) {
+  try {
+    fs.mkdirSync(CONFIG_DIR, { recursive: true });
+    if (fs.existsSync(LOG_PATH) && fs.statSync(LOG_PATH).size > LOG_MAX_BYTES) {
+      fs.renameSync(LOG_PATH, LOG_PATH + ".1");
+    }
+    fs.appendFileSync(LOG_PATH, `${new Date().toISOString()} pid=${process.pid} ${message}\n`);
+  } catch {
+    // Sin log no se detiene el host.
   }
 }
 
@@ -54,6 +73,91 @@ function writeNativeMessage(obj) {
   process.stdout.write(Buffer.concat([header, buf]));
 }
 
+// --- Deteccion del navegador y perfil que lanzo este host (por proceso padre) ---
+// El host lo lanza el navegador via native messaging, asi que subiendo la cadena de
+// procesos se llega a chrome/brave/edge. De su linea de comandos sale el perfil: sin
+// --user-data-dir (o con la carpeta por omision) es el principal; con otra carpeta es un
+// perfil secundario, que se nombra por esa carpeta (ej. /home/edu/chrome-arbe -> chrome-arbe).
+
+function browserFromComm(comm) {
+  if (comm.includes("brave")) return "brave";
+  if (comm.includes("chromium")) return "chromium";
+  if (comm.includes("chrome")) return "chrome";
+  if (comm.includes("edge") || comm.includes("msedge")) return "edge";
+  return null;
+}
+
+function userDataDir(pid) {
+  // Chrome reescribe su titulo de proceso: cmdline llega como una sola cadena separada por
+  // espacios, no por \0. Por eso se busca el flag con una expresion y no partiendo por \0.
+  try {
+    const cmdline = fs.readFileSync(`/proc/${pid}/cmdline`, "utf-8").replace(/\0/g, " ");
+    const match = cmdline.match(/--user-data-dir=(\S+)/);
+    return match ? match[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+function parentPid(pid) {
+  // /proc/<pid>/stat -> ppid es el campo tras ") <state>"
+  const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf-8");
+  const afterComm = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/);
+  return parseInt(afterComm[1], 10);
+}
+
+function detectBrowser() {
+  const unknown = { browser: "unknown", profile: "principal", principal: true, dataDir: null };
+  try {
+    let pid = process.ppid;
+    for (let i = 0; i < 8 && pid && pid > 1; i++) {
+      const comm = fs.readFileSync(`/proc/${pid}/comm`, "utf-8").trim().toLowerCase();
+      const browser = browserFromComm(comm);
+      if (browser) {
+        const dataDir = userDataDir(pid);
+        const isDefault = !dataDir || path.resolve(dataDir) === DEFAULT_DATA_DIRS[browser];
+        return {
+          browser,
+          profile: isDefault ? "principal" : path.basename(path.resolve(dataDir)),
+          principal: isDefault,
+          dataDir,
+        };
+      }
+      pid = parentPid(pid);
+    }
+  } catch {
+    // ignore
+  }
+  return unknown;
+}
+
+const IDENTITY = detectBrowser();
+
+/// A que puerto se conecta este host, o null para no conectarse a ninguno.
+///
+/// - OCIC_PORT en el entorno del navegador manda: alguien lo lanzo apuntado a proposito.
+/// - El perfil principal va al puerto de siempre (config.json "port").
+/// - Un perfil secundario va SOLO al puerto que tenga en config.json "profiles"; sin
+///   entrada no se conecta, para que nunca le quite el lugar al principal.
+function resolveTarget() {
+  if (process.env.OCIC_PORT) {
+    return { port: parseInt(process.env.OCIC_PORT, 10), source: "variable OCIC_PORT" };
+  }
+  const config = readConfig();
+  if (IDENTITY.principal) {
+    return { port: config.port || DEFAULT_PORT, source: config.port ? `${CONFIG_PATH} "port"` : "puerto por omision" };
+  }
+  const port = (config.profiles || {})[IDENTITY.profile];
+  if (port) return { port, source: `${CONFIG_PATH} "profiles"."${IDENTITY.profile}"` };
+  return { port: null, source: `el perfil "${IDENTITY.profile}" no tiene puerto en ${CONFIG_PATH} "profiles"` };
+}
+
+const TARGET = resolveTarget();
+log(
+  `navegador=${IDENTITY.browser} perfil=${IDENTITY.profile} carpeta=${IDENTITY.dataDir || "(por omision)"} ` +
+    (TARGET.port ? `puerto=${TARGET.port} (${TARGET.source})` : `sin conexion: ${TARGET.source}`),
+);
+
 // --- TCP connection to MCP server ---
 
 let tcpSocket = null;
@@ -61,7 +165,7 @@ let tcpBuffer = Buffer.alloc(0);
 let reconnectTimer = null;
 let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 60; // 30 seconds at 500ms intervals
-const TCP_PORT = getPort();
+const TCP_PORT = TARGET.port;
 
 function connectTcp() {
   if (tcpSocket) return;
@@ -73,6 +177,20 @@ function connectTcp() {
     if (reconnectTimer) {
       clearInterval(reconnectTimer);
       reconnectTimer = null;
+    }
+    // Anunciar que navegador somos, para que el bridge permita multi-navegador
+    // y switch. Es la PRIMERA linea, asi el bridge la lee al clasificar.
+    try {
+      tcpSocket.write(
+        JSON.stringify({
+          type: "native_hello",
+          browser: IDENTITY.browser,
+          profile: IDENTITY.profile,
+          principal: IDENTITY.principal,
+        }) + "\n",
+      );
+    } catch {
+      // ignore
     }
   });
 
@@ -137,5 +255,6 @@ process.stdin.on("end", () => {
   process.exit(0);
 });
 
-// Start TCP connection
-connectTcp();
+// Start TCP connection. Un perfil secundario sin puerto asignado se queda aislado: el host
+// sigue vivo para que la extension no lo relance en bucle, pero no habla con nadie.
+if (TCP_PORT) connectTcp();
