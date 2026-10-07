@@ -665,9 +665,9 @@ const toolHandlers = {
             const mkEvent = (type) => new MouseEvent(type, { view: window, bubbles: true, cancelable: true, button: 0, clientX: cx, clientY: cy });
             target.dispatchEvent(mkEvent('mousedown'));
             target.dispatchEvent(mkEvent('mouseup'));
-            target.dispatchEvent(mkEvent('click'));
-            // Also call .click() in case the framework uses pointer events / Vue/React synthetic listeners
-            try { target.click(); } catch(e) {}
+            // Un solo click: .click() ya dispara el evento click; mandarlo ademas a mano lo
+            // duplicaba y un interruptor o casilla quedaba como estaba.
+            target.click();
             return { ok: true, target: (target.tagName || '') + (target.id ? '#' + target.id : '') + (target.className && typeof target.className === 'string' ? '.' + target.className.trim().split(/\\s+/).slice(0,3).join('.') : ''), elementAtPoint: desc };
           })()
         `;
