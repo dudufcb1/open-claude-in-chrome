@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Open Claude in Chrome",
+  "name": "automaton",
   "version": "1.0.0",
-  "description": "Claude in Chrome, open source. No domain blocklist. Any Chromium browser.",
+  "description": "Control del navegador para automaton: pestañas, páginas, red y consola por CDP.",
   "minimum_chrome_version": "116",
   "permissions": [
     "tabs",
