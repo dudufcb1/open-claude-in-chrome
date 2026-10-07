@@ -291,16 +291,33 @@
   }
 
   // --- Element finding ---
-  // La consulta se parte en palabras y un elemento coincide si las tiene todas, en cualquier
-  // orden, entre su rol, nombre, texto y atributos ("New calendar button" encuentra un boton
-  // cuyo texto es "New calendar"). De cada coincidencia se queda la mas interna (los div que
-  // envuelven media pagina tambien "contienen" el texto y llenaban los 20 lugares) y se sube a
-  // su ancestro clicable mas cercano. Lo interactivo sale primero.
+  // La consulta se parte en palabras. Las de rol ("button", "link", "botón") son pista, no
+  // requisito, y las de relleno ("under", "the", "de") se ignoran. Primera pasada: elementos que
+  // tienen todas las palabras restantes, en cualquier orden, entre su rol, nombre, texto,
+  // atributos y clases. Si no hay ninguno, segunda pasada: los que mas palabras tienen en su
+  // texto PROPIO (sin el de sus hijos, para que no ganen los div que envuelven todo). De cada
+  // coincidencia se queda la mas interna y se sube a su ancestro clicable; primero lo que
+  // coincide con el rol pedido, luego lo interactivo.
   const MAX_FIND_RESULTS = 20;
   const CLICKABLE_LOOKUP_LEVELS = 4;
+  const ROLE_WORDS = {
+    button: "button", boton: "button", "botón": "button", btn: "button",
+    link: "link", enlace: "link", liga: "link",
+    input: "textbox", field: "textbox", campo: "textbox", textbox: "textbox", box: "textbox",
+    checkbox: "checkbox", casilla: "checkbox", switch: "switch", toggle: "switch",
+    tab: "tab", "pestaña": "tab", menu: "menuitem", option: "option", "opción": "option", select: "combobox",
+  };
+  const FILLER_WORDS = new Set([
+    "the", "a", "an", "of", "in", "on", "at", "to", "for", "with", "and", "or", "under", "above",
+    "below", "near", "next", "inside", "that", "this", "el", "la", "los", "las", "un", "una", "de",
+    "del", "en", "con", "para", "por", "y", "o", "que", "bajo", "debajo", "arriba", "junto", "dentro",
+  ]);
 
   function findElements(query) {
-    const tokens = String(query || "").toLowerCase().split(/\s+/).filter(Boolean);
+    const words = String(query || "").toLowerCase().split(/\s+/).filter(Boolean);
+    const wantedRoles = new Set(words.filter((w) => ROLE_WORDS[w]).map((w) => ROLE_WORDS[w]));
+    let tokens = words.filter((w) => !ROLE_WORDS[w] && !FILLER_WORDS.has(w));
+    if (!tokens.length) tokens = words.filter((w) => !FILLER_WORDS.has(w));
     if (!tokens.length) return [];
 
     // Collect all elements including those inside shadow roots
@@ -315,25 +332,51 @@
       return elements;
     }
 
-    // Incluye las clases ("n-button", "hr-checkbox") y marca como button lo clicable sin rol:
-    // asi "boton X" encuentra los botones que las librerias arman con div.
-    function searchableText(el) {
-      const tag = el.tagName.toLowerCase();
-      const role = getRole(el) || (isInteractive(el) ? "button" : "");
-      const classes = typeof el.className === "string" ? el.className.replace(/[-_]/g, " ") : "";
-      const parts = [
-        role, getAccessibleName(el) || "", el.textContent?.trim()?.substring(0, 200) || "",
-        el.placeholder || "", el.getAttribute("aria-label") || "", el.title || "", el.type || "", tag, classes,
-      ];
-      return parts.join(" ").toLowerCase();
+    function impliedRole(el) {
+      return getRole(el) || (isInteractive(el) ? "button" : "");
     }
 
-    const matches = [];
-    for (const el of collectAll(document)) {
+    // Atributos y clases ("n-button", "hr-checkbox"): asi "boton X" encuentra los botones que
+    // las librerias arman con div.
+    function attributesText(el) {
+      const classes = typeof el.className === "string" ? el.className.replace(/[-_]/g, " ") : "";
+      return [impliedRole(el), getAccessibleName(el) || "", el.placeholder || "", el.getAttribute("aria-label") || "",
+        el.title || "", el.type || "", el.tagName.toLowerCase(), classes].join(" ");
+    }
+
+    function fullText(el) {
+      return (attributesText(el) + " " + (el.textContent?.trim()?.substring(0, 200) || "")).toLowerCase();
+    }
+
+    function ownText(el) {
+      let direct = "";
+      for (const node of el.childNodes) if (node.nodeType === 3) direct += " " + node.textContent;
+      return (attributesText(el) + " " + direct).toLowerCase();
+    }
+
+    const candidates = collectAll(document).filter((el) => {
       const tag = el.tagName.toLowerCase();
-      if (["script", "style", "noscript", "template", "html", "head"].includes(tag)) continue;
-      const text = searchableText(el);
-      if (tokens.every((t) => text.includes(t)) && isVisible(el)) matches.push(el);
+      return !["script", "style", "noscript", "template", "html", "head"].includes(tag);
+    });
+
+    // Un contenedor que solo junta las palabras entre varios hijos ("General Information" del
+    // titulo + "Update Information" del boton) no cuenta: debe tener alguna en su texto propio o
+    // ser clicable. Si asi no queda nada, decide la segunda pasada.
+    let matches = candidates.filter((el) => {
+      if (!tokens.every((t) => fullText(el).includes(t)) || !isVisible(el)) return false;
+      const own = ownText(el);
+      return isInteractive(el) || tokens.some((t) => own.includes(t));
+    });
+    const scores = new Map();
+    if (!matches.length) {
+      const needed = Math.max(1, Math.ceil(tokens.length / 2));
+      for (const el of candidates) {
+        const text = ownText(el);
+        const score = tokens.filter((t) => text.includes(t)).length;
+        if (score >= needed && isVisible(el)) scores.set(el, score);
+      }
+      const best = Math.max(0, ...scores.values());
+      matches = [...scores.keys()].filter((el) => scores.get(el) >= Math.max(needed, best - 1));
     }
 
     // Solo las mas internas: se descarta todo elemento que tenga otra coincidencia adentro.
@@ -354,15 +397,14 @@
       return el;
     }
 
-    const seen = new Set();
-    const picked = [];
+    const seen = new Map(); // destino -> puntaje del mejor elemento que lo trajo
     for (const el of innermost) {
       const target = clickableAncestor(el);
-      if (seen.has(target)) continue;
-      seen.add(target);
-      picked.push(target);
+      seen.set(target, Math.max(seen.get(target) || 0, scores.get(el) || tokens.length));
     }
-    picked.sort((a, b) => Number(isInteractive(b)) - Number(isInteractive(a)));
+    const rank = (el) =>
+      (wantedRoles.has(impliedRole(el)) ? 4 : 0) + (isInteractive(el) ? 2 : 0) + (seen.get(el) || 0) * 10;
+    const picked = [...seen.keys()].sort((a, b) => rank(b) - rank(a));
 
     return picked.slice(0, MAX_FIND_RESULTS).map((el) => {
       const rect = el.getBoundingClientRect();
@@ -450,10 +492,18 @@
   }
 
   // --- Get element coordinates for ref ---
+  // Si el elemento esta fuera de la vista, primero se trae al centro (sin animacion): un clic
+  // con coordenadas de algo fuera de pantalla cae en otro lado.
   function getRefCoordinates(refId) {
     const el = resolveRef(refId);
     if (!el) return null;
-    const rect = el.getBoundingClientRect();
+    let rect = el.getBoundingClientRect();
+    const outside = rect.bottom < 0 || rect.right < 0 || rect.top > window.innerHeight || rect.left > window.innerWidth ||
+      rect.top < 0 || rect.bottom > window.innerHeight;
+    if (outside) {
+      el.scrollIntoView({ block: "center", inline: "nearest", behavior: "instant" });
+      rect = el.getBoundingClientRect();
+    }
     return {
       x: Math.round(rect.x + rect.width / 2),
       y: Math.round(rect.y + rect.height / 2),

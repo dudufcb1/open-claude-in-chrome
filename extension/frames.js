@@ -250,12 +250,15 @@ async function frameByNumber(tabId, n) {
   return rec;
 }
 
-/// Coordenadas en la pestana del centro de un elemento de iframe ("f2:ref_7").
+/// Coordenadas en la pestana del centro de un elemento de iframe ("f2:ref_7"). getRefCoordinates
+/// puede desplazar la pagina para traer el elemento a la vista, asi que la posicion del iframe
+/// se vuelve a leer despues.
 async function frameRefCoordinates(tabId, frameRef) {
   const rec = await frameByNumber(tabId, frameRef.n);
   const c = await frameCall(tabId, rec, "getRefCoordinates", frameRef.ref);
   if (!c) throw new Error(`No se encontro f${frameRef.n}:${frameRef.ref}; vuelve a usar find.`);
-  return [rec.x + c.x, rec.y + c.y];
+  const fresh = await frameByNumber(tabId, frameRef.n);
+  return [fresh.x + c.x, fresh.y + c.y];
 }
 
 /// El iframe mas interno que contiene el punto (x, y) de la pestana, o null.
@@ -407,15 +410,91 @@ function frameJsClickExpression(x, y) {
   })()`;
 }
 
+// --- Teclear dentro de un iframe ---
+// computer type teclea a nivel pestana; si el foco no quedo dentro del iframe (paso tras recargar
+// el iframe), el texto se iba a otro lado. Por eso se recuerda donde fue el ultimo clic y, si cayo
+// en un iframe, type escribe ahi: enfoca el campo, usa execCommand insertText (dispara los mismos
+// eventos que teclear, asi Vue y React lo ven) y, si eso no cambia el valor, lo pone directo.
+const FRAME_CLICK_MEMORY_MS = 120000;
+const frameLastClicks = new Map(); // tabId -> { n, ref, local: [x, y], at }
+
+function frameTypeExpression(target, text) {
+  return `(() => {
+    const api = window.__unblockedChrome;
+    const t = ${JSON.stringify(target)};
+    let el = t.ref ? api.resolveRef(t.ref) : null;
+    if (!el && t.local) el = document.elementFromPoint(t.local[0], t.local[1]);
+    if (el && !(el.isContentEditable || /^(INPUT|TEXTAREA)$/.test(el.tagName))) el = el.querySelector?.('input, textarea, [contenteditable="true"]') || el;
+    if (!el || !(el.isContentEditable || /^(INPUT|TEXTAREA)$/.test(el.tagName))) el = document.activeElement;
+    if (!el || !(el.isContentEditable || /^(INPUT|TEXTAREA)$/.test(el.tagName))) return { ok: false, error: 'no hay campo editable donde fue el clic' };
+    const read = () => (el.isContentEditable ? el.textContent : el.value);
+    const before = read();
+    el.focus();
+    try { document.execCommand('insertText', false, ${JSON.stringify(text)}); } catch (e) {}
+    if (read() === before) {
+      const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      if (el.isContentEditable) el.textContent = before + ${JSON.stringify(text)};
+      else Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, before + ${JSON.stringify(text)});
+      el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+    }
+    return { ok: true, value: read(), tag: el.tagName };
+  })()`;
+}
+
+async function frameRememberClick(args, coordinate, scoped) {
+  if (!["left_click", "double_click", "triple_click"].includes(args.action)) return;
+  const rec = await frameAtPoint(args.tabId, coordinate[0], coordinate[1]).catch(() => null);
+  if (!rec) {
+    frameLastClicks.delete(args.tabId);
+    return;
+  }
+  frameLastClicks.set(args.tabId, {
+    n: rec.n,
+    ref: scoped && scoped.n === rec.n ? scoped.ref : null,
+    local: [coordinate[0] - rec.x, coordinate[1] - rec.y],
+    at: Date.now(),
+  });
+}
+
+/// True si el foco de la pagina principal esta en un campo editable suyo: entonces el ultimo
+/// clic ya no fue en el iframe (por ejemplo, un os_click que no pasa por la extension).
+async function frameMainHasEditableFocus(tabId) {
+  const r = await cdp(tabId, "Runtime.evaluate", {
+    expression: "(() => { const a = document.activeElement; return !!a && (a.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName)); })()",
+    returnByValue: true,
+  }).catch(() => null);
+  return r?.result?.value === true;
+}
+
+async function frameType(args) {
+  const last = frameLastClicks.get(args.tabId);
+  if (!last || Date.now() - last.at > FRAME_CLICK_MEMORY_MS) return null;
+  if (await frameMainHasEditableFocus(args.tabId)) return null;
+  const rec = (await framesList(args.tabId)).find((r) => r.n === last.n);
+  if (!rec) return null;
+  const v = await frameEval(args.tabId, rec, frameTypeExpression(last, args.text)).catch(() => null);
+  if (!v?.ok) return null;
+  return frameText(`Typed "${args.text.substring(0, 50)}" dentro del iframe ${frameLabel(rec)} (<${v.tag}> quedó con "${String(v.value).substring(0, 80)}")`);
+}
+
 /// computer: un ref de iframe se traduce a coordenada de la pestana (los clics de CDP de la
-/// pestana si llegan al iframe), y un js_click sobre un iframe se corre adentro de el.
+/// pestana si llegan al iframe), un js_click sobre un iframe se corre adentro de el, y type
+/// escribe en el iframe donde fue el ultimo clic.
 async function frameComputer(args) {
+  if (args.action === "type" && args.text) {
+    const typed = await frameType(args);
+    if (typed) return typed;
+  }
   const scoped = frameParseRef(args.ref);
   if (scoped && !args.coordinate) {
     const coordinate = await frameRefCoordinates(args.tabId, scoped);
     const { ref, ...rest } = args;
-    return frameOriginal.computer({ ...rest, coordinate });
+    const result = await frameOriginal.computer({ ...rest, coordinate });
+    await frameRememberClick(args, coordinate, scoped);
+    return result;
   }
+  if (args.coordinate && args.action !== "js_click") await frameRememberClick(args, args.coordinate, null);
   if (args.action === "js_click" && args.coordinate) {
     const [x, y] = args.coordinate;
     const rec = await frameAtPoint(args.tabId, x, y).catch(() => null);
