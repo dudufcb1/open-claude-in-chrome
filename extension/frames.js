@@ -288,14 +288,17 @@ const frameOriginal = {
   computer: toolHandlers.computer,
 };
 
+/// Junta lo de la pagina y lo de cada iframe. "No elements found" solo sale si no hubo nada en
+/// ningun lado: antes salia arriba aunque abajo listara lo encontrado en un iframe.
 async function frameFind(args) {
-  const base = await frameOriginal.find(args);
-  let text = frameFirstText(base);
+  const base = frameFirstText(await frameOriginal.find(args));
+  const mainEmpty = base.startsWith("No elements found");
+  let text = mainEmpty ? "" : base;
   try {
     for (const rec of await framesList(args.tabId)) {
       const found = (await frameCall(args.tabId, rec, "findElements", args.query)) || [];
       if (!found.length) continue;
-      text += `\n\nDentro del iframe ${frameLabel(rec)}:\n`;
+      text += `${text ? "\n\n" : ""}Dentro del iframe ${frameLabel(rec)}:\n`;
       for (const r of found) {
         text += `[f${rec.n}:${r.ref}] ${r.role} "${r.name}" at (${rec.x + r.coordinates[0]}, ${rec.y + r.coordinates[1]})\n`;
       }
@@ -303,7 +306,7 @@ async function frameFind(args) {
   } catch (e) {
     text += `\n\n(No se pudieron revisar los iframes: ${e.message})`;
   }
-  return frameText(text);
+  return frameText(text || base);
 }
 
 async function frameReadPage(args) {
@@ -356,7 +359,7 @@ async function frameFormInput(args) {
 /// en uno del mismo proceso, en el mundo aislado (ve el DOM, no las variables de la pagina).
 async function frameJavascript(args) {
   if (!args.frame) return frameOriginal.javascript_tool(args);
-  if (!(await isInGroup(args.tabId))) return frameText(`Tab ${args.tabId} is not in the MCP group.`);
+  if (!(await isInGroup(args.tabId))) return frameText(`Tab ${args.tabId} is not in the MCP group. Usa tabs_context_mcp para ver las pestañas del grupo o crear una.`);
   const frames = await framesList(args.tabId);
   const wanted = String(args.frame);
   const rec = frames.find((r) => `f${r.n}` === wanted) || frames.find((r) => r.url.includes(wanted));
@@ -396,7 +399,9 @@ function frameJsClickExpression(x, y) {
     const cx = rect.left + rect.width / 2, cy = rect.top + rect.height / 2;
     const mk = (type) => new MouseEvent(type, { view: window, bubbles: true, cancelable: true, button: 0, clientX: cx, clientY: cy });
     // Un solo click: .click() ya dispara el evento click, mandarlo ademas a mano lo duplica.
-    target.dispatchEvent(mk('mousedown')); target.dispatchEvent(mk('mouseup'));
+    const mkp = (type) => new PointerEvent(type, { view: window, bubbles: true, cancelable: true, button: 0, clientX: cx, clientY: cy, pointerType: 'mouse', isPrimary: true });
+    target.dispatchEvent(mkp('pointerdown')); target.dispatchEvent(mk('mousedown'));
+    target.dispatchEvent(mkp('pointerup')); target.dispatchEvent(mk('mouseup'));
     target.click();
     return { ok: true, target: target.tagName + (target.id ? '#' + target.id : '') };
   })()`;

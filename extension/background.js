@@ -135,25 +135,21 @@ function formatTabContext(tabs) {
   };
 }
 
+/// La pestana es nuestra si esta en un grupo de la extension ("Chrome", o "MCP" de versiones
+/// viejas). Puede haber varios grupos de sesiones distintas: al recargarse la extension se
+/// quedaba con el primero que encontraba y las pestanas de los demas respondian "not in the
+/// MCP group". Ahora se adopta el grupo de la pestana que se pide.
 async function isInGroup(tabId) {
-  // Always check live state — in-memory tabGroupTabs can be stale after service worker restart
   try {
     const tab = await chrome.tabs.get(tabId);
-    if (tab.groupId !== -1) {
-      // Recover tabGroupId if we lost it (service worker restart)
-      if (tabGroupId === null) {
-        try {
-          const group = await chrome.tabGroups.get(tab.groupId);
-          if (group.title === "Chrome") {
-            tabGroupId = group.id;
-            const groupTabs = await chrome.tabs.query({ groupId: tabGroupId });
-            tabGroupTabs = new Set(groupTabs.map((t) => t.id));
-          }
-        } catch {}
-      }
-      return tab.groupId === tabGroupId;
-    }
-    return tabGroupTabs.has(tabId);
+    if (tab.groupId === -1) return tabGroupTabs.has(tabId);
+    if (tab.groupId === tabGroupId) return true;
+    const group = await chrome.tabGroups.get(tab.groupId);
+    if (group.title !== "Chrome" && group.title !== "MCP") return false;
+    tabGroupId = group.id;
+    const groupTabs = await chrome.tabs.query({ groupId: tabGroupId });
+    tabGroupTabs = new Set(groupTabs.map((t) => t.id));
+    return true;
   } catch {
     return false;
   }
@@ -432,7 +428,7 @@ const toolHandlers = {
 
   async navigate(args) {
     const { url, tabId } = args;
-    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group. Usa tabs_context_mcp para ver las pestañas del grupo o crear una.` }] };
 
     if (url === "back") {
       await chrome.tabs.goBack(tabId);
@@ -483,7 +479,7 @@ const toolHandlers = {
   async keyword_planner(args) {
     const { words, tabId } = args;
     if (!Array.isArray(words) || !words.length) return { content: [{ type: "text", text: "keyword_planner: 'words' debe ser un array no vacio." }] };
-    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group. Usa tabs_context_mcp para ver las pestañas del grupo o crear una.` }] };
 
     const ev = async (expr) => {
       await ensureAttached(tabId);
@@ -602,7 +598,7 @@ const toolHandlers = {
 
   async computer(args) {
     const { action, tabId } = args;
-    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group. Usa tabs_context_mcp para ver las pestañas del grupo o crear una.` }] };
 
     let coordinate = args.coordinate;
     // Resolve ref to coordinates if provided
@@ -663,7 +659,12 @@ const toolHandlers = {
             const cx = rect.left + rect.width / 2;
             const cy = rect.top + rect.height / 2;
             const mkEvent = (type) => new MouseEvent(type, { view: window, bubbles: true, cancelable: true, button: 0, clientX: cx, clientY: cy });
+            // Eventos de puntero antes que los de raton: componentes como el hr-checkbox de GHL
+            // solo escuchan pointerdown/pointerup.
+            const mkPointer = (type) => new PointerEvent(type, { view: window, bubbles: true, cancelable: true, button: 0, clientX: cx, clientY: cy, pointerType: 'mouse', isPrimary: true });
+            target.dispatchEvent(mkPointer('pointerdown'));
             target.dispatchEvent(mkEvent('mousedown'));
+            target.dispatchEvent(mkPointer('pointerup'));
             target.dispatchEvent(mkEvent('mouseup'));
             // Un solo click: .click() ya dispara el evento click; mandarlo ademas a mano lo
             // duplicaba y un interruptor o casilla quedaba como estaba.
@@ -836,7 +837,7 @@ const toolHandlers = {
 
   async read_page(args) {
     const { tabId } = args;
-    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group. Usa tabs_context_mcp para ver las pestañas del grupo o crear una.` }] };
 
     const resp = await sendContentMessage(tabId, {
       type: "generateAccessibilityTree",
@@ -862,7 +863,7 @@ const toolHandlers = {
 
   async get_page_text(args) {
     const { tabId } = args;
-    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group. Usa tabs_context_mcp para ver las pestañas del grupo o crear una.` }] };
 
     const resp = await sendContentMessage(tabId, { type: "getPageText" });
     if (!resp?.result) return { content: [{ type: "text", text: "Error: Could not extract page text" }] };
@@ -884,7 +885,7 @@ const toolHandlers = {
 
   async find(args) {
     const { query, tabId } = args;
-    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group. Usa tabs_context_mcp para ver las pestañas del grupo o crear una.` }] };
 
     const resp = await sendContentMessage(tabId, { type: "findElements", query });
     const results = resp?.result || [];
@@ -903,7 +904,7 @@ const toolHandlers = {
 
   async form_input(args) {
     const { ref, value, tabId } = args;
-    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group. Usa tabs_context_mcp para ver las pestañas del grupo o crear una.` }] };
 
     const resp = await sendContentMessage(tabId, { type: "setFormValue", ref, value });
     const result = resp?.result;
@@ -914,7 +915,7 @@ const toolHandlers = {
 
   async javascript_tool(args) {
     const { text, tabId } = args;
-    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group. Usa tabs_context_mcp para ver las pestañas del grupo o crear una.` }] };
 
     await ensureAttached(tabId);
     try {
@@ -942,7 +943,7 @@ const toolHandlers = {
 
   async read_console_messages(args) {
     const { tabId, pattern, limit = 100, onlyErrors, clear } = args;
-    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group. Usa tabs_context_mcp para ver las pestañas del grupo o crear una.` }] };
 
     // Ensure console domain is enabled
     await ensureAttached(tabId);
@@ -984,7 +985,7 @@ const toolHandlers = {
 
   async read_network_requests(args) {
     const { tabId, urlPattern, limit = 100, clear } = args;
-    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group. Usa tabs_context_mcp para ver las pestañas del grupo o crear una.` }] };
 
     // Ensure network domain is enabled
     await ensureAttached(tabId);
@@ -1015,7 +1016,7 @@ const toolHandlers = {
 
   async tabs_activate(args) {
     const { tabId } = args;
-    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group. Usa tabs_context_mcp para ver las pestañas del grupo o crear una.` }] };
 
     await chrome.tabs.update(tabId, { active: true });
     const tab = await chrome.tabs.get(tabId);
@@ -1028,7 +1029,7 @@ const toolHandlers = {
 
   async resize_window(args) {
     const { width, height, tabId } = args;
-    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group. Usa tabs_context_mcp para ver las pestañas del grupo o crear una.` }] };
 
     const tab = await chrome.tabs.get(tabId);
     await chrome.windows.update(tab.windowId, { width, height });
@@ -1037,7 +1038,7 @@ const toolHandlers = {
 
   async upload_image(args) {
     const { imageId, tabId, ref, coordinate, filename = "image.png" } = args;
-    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group. Usa tabs_context_mcp para ver las pestañas del grupo o crear una.` }] };
 
     const base64 = screenshotStore.get(imageId);
     if (!base64) {

@@ -339,7 +339,7 @@ function monText(text) {
 const monToolHandlers = {
   async monitor_start(args) {
     const { tabId, reload = false } = args;
-    if (!(await isInGroup(tabId))) return monText(`Tab ${tabId} is not in the MCP group.`);
+    if (!(await isInGroup(tabId))) return monText(`Tab ${tabId} is not in the MCP group. Usa tabs_context_mcp para ver las pestañas del grupo o crear una.`);
     if (monSessions.has(tabId)) {
       return monText(`Ya se esta grabando esta pestana en ${monPath(monSessions.get(tabId).session)}`);
     }
