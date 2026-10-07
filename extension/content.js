@@ -368,6 +368,7 @@
       return isInteractive(el) || tokens.some((t) => own.includes(t));
     });
     const scores = new Map();
+    const complete = matches.length > 0;
     if (!matches.length) {
       const needed = Math.max(1, Math.ceil(tokens.length / 2));
       for (const el of candidates) {
@@ -414,6 +415,9 @@
         role: getRole(el) || tag,
         name: getAccessibleName(el) || el.textContent?.trim()?.substring(0, 80) || "",
         coordinates: [Math.round(rect.x + rect.width / 2), Math.round(rect.y + rect.height / 2)],
+        // "full": tiene todas las palabras; "partial": solo la mayoria. frames.js lo usa para
+        // no mostrar coincidencias parciales de un frame cuando otro tiene una completa.
+        match: complete ? "full" : "partial",
       };
     });
   }

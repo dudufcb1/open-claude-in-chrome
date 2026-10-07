@@ -291,25 +291,57 @@ const frameOriginal = {
   computer: toolHandlers.computer,
 };
 
-/// Junta lo de la pagina y lo de cada iframe. "No elements found" solo sale si no hubo nada en
-/// ningun lado: antes salia arriba aunque abajo listara lo encontrado en un iframe.
+/// Iframes que ya estan en la pagina principal pero todavia no se pudieron enganchar (se montan
+/// tarde, por ejemplo justo despues de navegar). Se comparan por origen con los ya listados.
+async function framesStillLoading(tabId, frames) {
+  const r = await cdp(tabId, "Runtime.evaluate", {
+    expression: `[...document.querySelectorAll('iframe')].filter((f) => { const b = f.getBoundingClientRect(); return b.width > 0 && b.height > 0; }).map((f) => f.src).filter((u) => /^https?:/.test(u))`,
+    returnByValue: true,
+  }).catch(() => null);
+  const origin = (u) => { try { return new URL(u).origin; } catch { return u; } };
+  const known = new Set(frames.filter((f) => !f.ownerSession).map((f) => origin(f.url)));
+  return (r?.result?.value || []).filter((u) => !known.has(origin(u)));
+}
+
+/// Junta lo de la pagina y lo de cada iframe. Si en algun frame hay una coincidencia completa,
+/// las parciales de los demas no se muestran (antes salian primero las debiles de la pagina
+/// principal y despues la exacta del iframe). "No elements found" solo sale si no hubo nada en
+/// ningun lado, y se avisa de los iframes que todavia estan cargando.
 async function frameFind(args) {
-  const base = frameFirstText(await frameOriginal.find(args));
-  const mainEmpty = base.startsWith("No elements found");
-  let text = mainEmpty ? "" : base;
+  if (!(await isInGroup(args.tabId))) return frameOriginal.find(args);
+  const groups = [];
+  const main = (await sendContentMessage(args.tabId, { type: "findElements", query: args.query }))?.result || [];
+  groups.push({ rec: null, found: main });
+  let frames = [];
+  let problem = "";
   try {
-    for (const rec of await framesList(args.tabId)) {
+    frames = await framesList(args.tabId);
+    for (const rec of frames) {
       const found = (await frameCall(args.tabId, rec, "findElements", args.query)) || [];
-      if (!found.length) continue;
-      text += `${text ? "\n\n" : ""}Dentro del iframe ${frameLabel(rec)}:\n`;
-      for (const r of found) {
-        text += `[f${rec.n}:${r.ref}] ${r.role} "${r.name}" at (${rec.x + r.coordinates[0]}, ${rec.y + r.coordinates[1]})\n`;
-      }
+      groups.push({ rec, found });
     }
   } catch (e) {
-    text += `\n\n(No se pudieron revisar los iframes: ${e.message})`;
+    problem = `(No se pudieron revisar los iframes: ${e.message})`;
   }
-  return frameText(text || base);
+  const anyFull = groups.some((g) => g.found.some((r) => r.match !== "partial"));
+  const lines = [];
+  // Los frames con coincidencia completa van primero.
+  groups.sort((a, b) => Number(b.found.some((r) => r.match !== "partial")) - Number(a.found.some((r) => r.match !== "partial")));
+  for (const { rec, found } of groups) {
+    const shown = anyFull ? found.filter((r) => r.match !== "partial") : found;
+    if (!shown.length) continue;
+    const dx = rec ? rec.x : 0;
+    const dy = rec ? rec.y : 0;
+    const prefix = rec ? `f${rec.n}:` : "";
+    lines.push(rec ? `Dentro del iframe ${frameLabel(rec)}:` : `En la página:`);
+    for (const r of shown) lines.push(`[${prefix}${r.ref}] ${r.role} "${r.name}" at (${dx + r.coordinates[0]}, ${dy + r.coordinates[1]})`);
+    lines.push("");
+  }
+  const loading = await framesStillLoading(args.tabId, frames).catch(() => []);
+  let text = lines.length ? `${anyFull ? "" : "Solo coincidencias parciales.\n"}${lines.join("\n").trimEnd()}` : `No elements found matching "${args.query}"`;
+  if (loading.length) text += `\n\nTodavía cargando (aún no se puede buscar adentro; reintenta en unos segundos): ${loading.join(", ")}`;
+  if (problem) text += `\n\n${problem}`;
+  return frameText(text.trim());
 }
 
 async function frameReadPage(args) {
