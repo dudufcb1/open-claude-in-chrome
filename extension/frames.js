@@ -291,22 +291,38 @@ const frameOriginal = {
   computer: toolHandlers.computer,
 };
 
-/// Iframes que ya estan en la pagina principal pero todavia no se pudieron enganchar (se montan
-/// tarde, por ejemplo justo despues de navegar). Se comparan por origen con los ya listados.
+const FRAME_LOADING_MIN_AREA = 200 * 200; // Un iframe chico sin controles (un anuncio) no cuenta como "cargando"
+
+/// Lo que todavia esta cargando y por eso puede esconder lo que se busca:
+/// - <iframe> visibles de la pagina que aun no se pudieron enganchar (se montan tarde);
+/// - iframes enganchados y grandes cuyo documento no termino de cargar o no tiene ningun control
+///   todavia (la app de adentro, Vue por ejemplo, aun no pinta);
+/// - la pagina principal misma, si no termino de cargar.
 async function framesStillLoading(tabId, frames) {
+  const notes = [];
   const r = await cdp(tabId, "Runtime.evaluate", {
-    expression: `[...document.querySelectorAll('iframe')].filter((f) => { const b = f.getBoundingClientRect(); return b.width > 0 && b.height > 0; }).map((f) => f.src).filter((u) => /^https?:/.test(u))`,
+    expression: `({ ready: document.readyState, srcs: [...document.querySelectorAll('iframe')].filter((f) => { const b = f.getBoundingClientRect(); return b.width > 0 && b.height > 0; }).map((f) => f.src).filter((u) => /^https?:/.test(u)) })`,
     returnByValue: true,
   }).catch(() => null);
+  const page = r?.result?.value || { ready: "complete", srcs: [] };
+  if (page.ready !== "complete") notes.push("la página principal (todavía no termina de cargar)");
   const origin = (u) => { try { return new URL(u).origin; } catch { return u; } };
   const known = new Set(frames.filter((f) => !f.ownerSession).map((f) => origin(f.url)));
-  return (r?.result?.value || []).filter((u) => !known.has(origin(u)));
+  for (const u of page.srcs.filter((u) => !known.has(origin(u)))) notes.push(`${u} (aún no se puede entrar)`);
+  for (const rec of frames) {
+    if (rec.width * rec.height < FRAME_LOADING_MIN_AREA) continue;
+    const state = await frameEval(tabId, rec, `({ ready: document.readyState, controls: document.querySelectorAll('input, button, a[href], select, textarea, [role], [tabindex]').length })`).catch(() => null);
+    if (!state) continue;
+    if (state.ready !== "complete") notes.push(`iframe f${rec.n} ${rec.url} (su documento sigue cargando)`);
+    else if (state.controls === 0) notes.push(`iframe f${rec.n} ${rec.url} (todavía no pinta su contenido)`);
+  }
+  return notes;
 }
 
 /// Junta lo de la pagina y lo de cada iframe. Si en algun frame hay una coincidencia completa,
 /// las parciales de los demas no se muestran (antes salian primero las debiles de la pagina
 /// principal y despues la exacta del iframe). "No elements found" solo sale si no hubo nada en
-/// ningun lado, y se avisa de los iframes que todavia estan cargando.
+/// ningun lado. Si no hubo coincidencia completa y algo sigue cargando, se avisa.
 async function frameFind(args) {
   if (!(await isInGroup(args.tabId))) return frameOriginal.find(args);
   const groups = [];
@@ -323,12 +339,12 @@ async function frameFind(args) {
   } catch (e) {
     problem = `(No se pudieron revisar los iframes: ${e.message})`;
   }
-  const anyFull = groups.some((g) => g.found.some((r) => r.match !== "partial"));
+  const isFull = (r) => r.match !== "partial";
+  const anyFull = groups.some((g) => g.found.some(isFull));
   const lines = [];
-  // Los frames con coincidencia completa van primero.
-  groups.sort((a, b) => Number(b.found.some((r) => r.match !== "partial")) - Number(a.found.some((r) => r.match !== "partial")));
+  groups.sort((a, b) => Number(b.found.some(isFull)) - Number(a.found.some(isFull)));
   for (const { rec, found } of groups) {
-    const shown = anyFull ? found.filter((r) => r.match !== "partial") : found;
+    const shown = anyFull ? found.filter(isFull) : found;
     if (!shown.length) continue;
     const dx = rec ? rec.x : 0;
     const dy = rec ? rec.y : 0;
@@ -337,9 +353,11 @@ async function frameFind(args) {
     for (const r of shown) lines.push(`[${prefix}${r.ref}] ${r.role} "${r.name}" at (${dx + r.coordinates[0]}, ${dy + r.coordinates[1]})`);
     lines.push("");
   }
-  const loading = await framesStillLoading(args.tabId, frames).catch(() => []);
   let text = lines.length ? `${anyFull ? "" : "Solo coincidencias parciales.\n"}${lines.join("\n").trimEnd()}` : `No elements found matching "${args.query}"`;
-  if (loading.length) text += `\n\nTodavía cargando (aún no se puede buscar adentro; reintenta en unos segundos): ${loading.join(", ")}`;
+  if (!anyFull) {
+    const loading = await framesStillLoading(args.tabId, frames).catch(() => []);
+    if (loading.length) text += `\n\nPuede que lo que buscas esté en algo que sigue cargando; reintenta en unos segundos:\n- ${loading.join("\n- ")}`;
+  }
   if (problem) text += `\n\n${problem}`;
   return frameText(text.trim());
 }
