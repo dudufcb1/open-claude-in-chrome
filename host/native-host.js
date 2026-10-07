@@ -232,6 +232,23 @@ function connectTcp() {
   });
 }
 
+// --- Monitor de pagina: la extension manda cada evento y aqui se escribe en disco ---
+// Una linea JSON por evento en /tmp/page-monitor/<sesion>.jsonl. Se escribe aqui y no en el
+// MCP porque el host vive mientras el navegador este abierto, haya o no automaton conectado.
+
+const MON_DIR = "/tmp/page-monitor"; // Debe coincidir con extension/page-monitor.js y con automaton
+const MON_SESSION_NAME = /^[\w.-]+$/; // Evita que un nombre raro escriba fuera de MON_DIR
+
+function writeMonitorEvent(msg) {
+  if (typeof msg.session !== "string" || !MON_SESSION_NAME.test(msg.session)) return;
+  try {
+    fs.mkdirSync(MON_DIR, { recursive: true });
+    fs.appendFileSync(path.join(MON_DIR, `${msg.session}.jsonl`), JSON.stringify(msg.event) + "\n");
+  } catch (e) {
+    log(`page-monitor: no se pudo escribir ${msg.session}: ${e.message}`);
+  }
+}
+
 // --- Main: bridge stdin (from extension) <-> TCP (to MCP server) ---
 
 let stdinBuffer = Buffer.alloc(0);
@@ -242,6 +259,10 @@ process.stdin.on("data", (chunk) => {
   stdinBuffer = remainder;
 
   for (const msg of messages) {
+    if (msg.type === "monitor_event") {
+      writeMonitorEvent(msg);
+      continue;
+    }
     // Forward to MCP server via TCP
     if (tcpSocket && !tcpSocket.destroyed) {
       tcpSocket.write(JSON.stringify(msg) + "\n");

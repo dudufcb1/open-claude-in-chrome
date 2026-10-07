@@ -1103,6 +1103,9 @@ const toolHandlers = {
   },
 };
 
+// Monitor de pagina (monitor_*): vive aparte y se cuelga de toolHandlers al cargarse.
+importScripts("page-monitor.js");
+
 // --- Tool dispatch ---
 async function handleToolRequest(id, tool, args) {
   const handler = toolHandlers[tool];
