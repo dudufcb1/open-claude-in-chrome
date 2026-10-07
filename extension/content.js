@@ -123,9 +123,11 @@
       if (labelText) return labelText;
     }
 
-    // Direct text content (only for leaf-ish elements)
+    // Direct text content (only for leaf-ish elements). Tambien para div clicables o con rol:
+    // las librerias de componentes (Naive UI, el HighRise de GHL) arman botones con div.
     const tag = el.tagName.toLowerCase();
-    if (["a", "button", "h1", "h2", "h3", "h4", "h5", "h6", "li", "summary", "label", "th", "td", "span"].includes(tag)) {
+    if (["a", "button", "h1", "h2", "h3", "h4", "h5", "h6", "li", "summary", "label", "th", "td", "span"].includes(tag) ||
+        el.getAttribute("role") || isInteractive(el)) {
       const text = el.textContent?.trim();
       if (text && text.length < 200) return text;
     }
@@ -152,6 +154,8 @@
     return true;
   }
 
+  const MAX_DOM_DEPTH = 300;
+
   // --- Accessibility tree generation ---
   function generateAccessibilityTree(options = {}) {
     const filter = options.filter || "all";
@@ -176,9 +180,12 @@
       return true;
     }
 
-    function walk(el, depth, indent) {
+    // depth cuenta solo los niveles que se muestran; domDepth es un tope de seguridad. Antes
+    // depth contaba cada div y en apps con mucho anidamiento (GHL, Vue) el arbol se cortaba
+    // antes de llegar a los botones.
+    function walk(el, depth, indent, domDepth = 0) {
       if (truncated) return;
-      if (depth > maxDepth) return;
+      if (depth > maxDepth || domDepth > MAX_DOM_DEPTH) return;
       if (!el || el.nodeType !== 1) return;
 
       const tag = el.tagName.toLowerCase();
@@ -228,14 +235,16 @@
       }
 
       // Recurse children (including shadow DOM)
-      const nextIndent = shouldShow && visible ? indent + "  " : indent;
+      const shown = shouldShow && visible;
+      const nextIndent = shown ? indent + "  " : indent;
+      const nextDepth = shown ? depth + 1 : depth;
       if (el.shadowRoot) {
         for (const child of el.shadowRoot.children) {
-          walk(child, depth + 1, nextIndent);
+          walk(child, nextDepth, nextIndent, domDepth + 1);
         }
       }
       for (const child of el.children) {
-        walk(child, depth + 1, nextIndent);
+        walk(child, nextDepth, nextIndent, domDepth + 1);
       }
     }
 
@@ -282,9 +291,17 @@
   }
 
   // --- Element finding ---
+  // La consulta se parte en palabras y un elemento coincide si las tiene todas, en cualquier
+  // orden, entre su rol, nombre, texto y atributos ("New calendar button" encuentra un boton
+  // cuyo texto es "New calendar"). De cada coincidencia se queda la mas interna (los div que
+  // envuelven media pagina tambien "contienen" el texto y llenaban los 20 lugares) y se sube a
+  // su ancestro clicable mas cercano. Lo interactivo sale primero.
+  const MAX_FIND_RESULTS = 20;
+  const CLICKABLE_LOOKUP_LEVELS = 4;
+
   function findElements(query) {
-    const q = query.toLowerCase();
-    const results = [];
+    const tokens = String(query || "").toLowerCase().split(/\s+/).filter(Boolean);
+    if (!tokens.length) return [];
 
     // Collect all elements including those inside shadow roots
     function collectAll(root) {
@@ -298,37 +315,65 @@
       return elements;
     }
 
-    const all = collectAll(document);
-
-    for (const el of all) {
-      if (results.length >= 20) break;
-      if (!isVisible(el)) continue;
-
+    // Incluye las clases ("n-button", "hr-checkbox") y marca como button lo clicable sin rol:
+    // asi "boton X" encuentra los botones que las librerias arman con div.
+    function searchableText(el) {
       const tag = el.tagName.toLowerCase();
-      if (["script", "style", "noscript", "template"].includes(tag)) continue;
+      const role = getRole(el) || (isInteractive(el) ? "button" : "");
+      const classes = typeof el.className === "string" ? el.className.replace(/[-_]/g, " ") : "";
+      const parts = [
+        role, getAccessibleName(el) || "", el.textContent?.trim()?.substring(0, 200) || "",
+        el.placeholder || "", el.getAttribute("aria-label") || "", el.title || "", el.type || "", tag, classes,
+      ];
+      return parts.join(" ").toLowerCase();
+    }
 
-      const role = getRole(el) || "";
-      const name = getAccessibleName(el) || "";
-      const text = el.textContent?.trim()?.substring(0, 200) || "";
-      const placeholder = el.placeholder || "";
-      const ariaLabel = el.getAttribute("aria-label") || "";
-      const title = el.title || "";
-      const type = el.type || "";
+    const matches = [];
+    for (const el of collectAll(document)) {
+      const tag = el.tagName.toLowerCase();
+      if (["script", "style", "noscript", "template", "html", "head"].includes(tag)) continue;
+      const text = searchableText(el);
+      if (tokens.every((t) => text.includes(t)) && isVisible(el)) matches.push(el);
+    }
 
-      const searchable = `${role} ${name} ${text} ${placeholder} ${ariaLabel} ${title} ${type} ${tag}`.toLowerCase();
-
-      if (searchable.includes(q)) {
-        const ref = getOrAssignRef(el);
-        const rect = el.getBoundingClientRect();
-        results.push({
-          ref,
-          role: role || tag,
-          name: name || text.substring(0, 80),
-          coordinates: [Math.round(rect.x + rect.width / 2), Math.round(rect.y + rect.height / 2)],
-        });
+    // Solo las mas internas: se descarta todo elemento que tenga otra coincidencia adentro.
+    const hasMatchInside = new Set();
+    for (const el of matches) {
+      for (let p = el.parentElement; p; p = p.parentElement) {
+        if (hasMatchInside.has(p)) break;
+        hasMatchInside.add(p);
       }
     }
-    return results;
+    const innermost = matches.filter((el) => !hasMatchInside.has(el));
+
+    function clickableAncestor(el) {
+      let node = el;
+      for (let i = 0; node && i <= CLICKABLE_LOOKUP_LEVELS; i++, node = node.parentElement) {
+        if (isInteractive(node)) return node;
+      }
+      return el;
+    }
+
+    const seen = new Set();
+    const picked = [];
+    for (const el of innermost) {
+      const target = clickableAncestor(el);
+      if (seen.has(target)) continue;
+      seen.add(target);
+      picked.push(target);
+    }
+    picked.sort((a, b) => Number(isInteractive(b)) - Number(isInteractive(a)));
+
+    return picked.slice(0, MAX_FIND_RESULTS).map((el) => {
+      const rect = el.getBoundingClientRect();
+      const tag = el.tagName.toLowerCase();
+      return {
+        ref: getOrAssignRef(el),
+        role: getRole(el) || tag,
+        name: getAccessibleName(el) || el.textContent?.trim()?.substring(0, 80) || "",
+        coordinates: [Math.round(rect.x + rect.width / 2), Math.round(rect.y + rect.height / 2)],
+      };
+    });
   }
 
   // --- Form input ---
