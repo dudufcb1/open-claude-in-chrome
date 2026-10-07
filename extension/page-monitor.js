@@ -12,21 +12,17 @@
 //
 // Iframes de otro dominio y workers: Chrome los corre en otro proceso y el Network de la pestana
 // no ve su trafico (por ejemplo el builder de workflows de GHL, que vive en un iframe de
-// leadconnectorhq.com). Por eso se activa Target.setAutoAttach: Chrome engancha cada iframe o
-// worker como sesion hija (sessionId) y en cada una se encienden los mismos dominios. Sus eventos
-// llevan los campos frame (url del iframe o worker) y target (iframe, worker, service_worker).
+// leadconnectorhq.com). frames.js los engancha como sesiones hijas (sessionId) y aqui, mientras
+// se graba, se encienden en cada una los mismos dominios. Sus eventos llevan los campos frame
+// (url del iframe o worker) y target (iframe, worker, service_worker).
 
 const MON_DIR = "/tmp/page-monitor"; // Debe coincidir con el host nativo y con automaton
 const MON_BODY_MAX_CHARS = 2_000_000; // Un body mas grande se corta y se marca body_truncated
 const MON_POST_DATA_MAX_BYTES = 1_000_000;
 const MON_BODY_TYPES = new Set(["XHR", "Fetch", "Document", "EventSource"]);
 const MON_BACKLOG_MAX = 5000;
-// waitForDebuggerOnStart deja cada iframe o worker en pausa hasta encender sus dominios, para no
-// perder sus primeras llamadas. Siempre se reanuda con Runtime.runIfWaitingForDebugger.
-const MON_AUTO_ATTACH = { autoAttach: true, waitForDebuggerOnStart: true, flatten: true };
 
-// tabId -> { session, seq, section, requests: Map(clave -> {type, mime, start}),
-//            children: Map(sessionId -> {type, url, targetId}), backlog }
+// tabId -> { session, seq, section, requests: Map(clave -> {type, mime, start}), backlog }
 const monSessions = new Map();
 
 function monPath(session) {
@@ -66,7 +62,7 @@ function monWrite(tabId, kind, fields) {
 
 /// De donde vino un evento. sid es null para la pestana principal.
 function monContext(tabId, s, sid) {
-  return { tabId, s, sid, child: sid ? s.children.get(sid) || null : null };
+  return { tabId, s, sid, child: sid ? frameSessionInfo(tabId, sid) : null };
 }
 
 /// Los ids de request se repiten entre la pestana y cada iframe o worker, asi que los de una
@@ -262,64 +258,46 @@ function monOnPage(c, method, p) {
       if (!p.frame.parentId && !c.sid) {
         monEmit(c, "navigation", { url: p.frame.url });
         // Una navegacion a otro dominio puede cambiar de proceso; se repite el auto-attach.
-        monSend(c, "Target.setAutoAttach", MON_AUTO_ATTACH).catch(() => {});
+        framesEnsure(c.tabId).catch(() => {});
       }
       return;
   }
 }
 
-// --- Sesiones hijas: iframes de otro dominio y workers ---
+// --- Sesiones hijas: iframes de otro dominio y workers (las engancha frames.js) ---
 
 /// Enciende en la sesion hija los mismos dominios que en la pestana. Cada uno va por separado
-/// porque un worker no tiene Log ni Target y eso no debe impedir grabar su red. Al final se
-/// reanuda SIEMPRE: si no, el iframe o worker se queda congelado esperando al depurador.
-async function monAttachChild(tabId, s, p) {
-  const c = { tabId, s, sid: p.sessionId, child: null };
-  try {
-    if (!s) return;
-    s.children.set(p.sessionId, { type: p.targetInfo.type, url: p.targetInfo.url, targetId: p.targetInfo.targetId });
-    c.child = s.children.get(p.sessionId);
-    monEmit(c, "target", { action: "attached", target_session: p.sessionId });
-    const steps = [
-      ["Network.enable", { maxPostDataSize: MON_POST_DATA_MAX_BYTES }],
-      ["Runtime.enable", {}],
-      ["Log.enable", {}],
-      ["Target.setAutoAttach", MON_AUTO_ATTACH], // iframes dentro del iframe
-    ];
-    for (const [method, params] of steps) {
-      try {
-        await monSend(c, method, params);
-      } catch {
-        // Ese dominio no existe en este tipo de target; se sigue con los demas.
-      }
+/// porque un worker no tiene Log y eso no debe impedir grabar su red. frames.js la reanuda
+/// despues de esto (el iframe llega en pausa mientras se graba, para no perder sus primeras
+/// llamadas).
+async function monEnableChild(tabId, sessionId) {
+  const c = monContext(tabId, monSessions.get(tabId), sessionId);
+  monEmit(c, "target", { action: "attached", target_session: sessionId });
+  for (const [method, params] of [
+    ["Network.enable", { maxPostDataSize: MON_POST_DATA_MAX_BYTES }],
+    ["Runtime.enable", {}],
+    ["Log.enable", {}],
+  ]) {
+    try {
+      await monSend(c, method, params);
+    } catch {
+      // Ese dominio no existe en este tipo de target; se sigue con los demas.
     }
-  } finally {
-    monSend(c, "Runtime.runIfWaitingForDebugger").catch(() => {});
   }
 }
 
-function monOnTarget(tabId, s, method, p) {
-  if (method === "Target.attachedToTarget") {
-    monAttachChild(tabId, s, p);
-  } else if (method === "Target.detachedFromTarget" && s?.children.has(p.sessionId)) {
-    monEmit(monContext(tabId, s, p.sessionId), "target", { action: "detached", target_session: p.sessionId });
-    s.children.delete(p.sessionId);
-  } else if (method === "Target.targetInfoChanged" && s) {
-    // Un iframe que navega cambia de url; se actualiza para que sus eventos digan la nueva.
-    for (const child of s.children.values()) {
-      if (child.targetId === p.targetInfo.targetId) child.url = p.targetInfo.url;
-    }
-  }
-}
+frameAttachHooks.push(async (tabId, sessionId) => {
+  if (monSessions.has(tabId)) await monEnableChild(tabId, sessionId);
+});
+frameDetachHooks.push((tabId, sessionId) => {
+  const s = monSessions.get(tabId);
+  if (s) monEmit(monContext(tabId, s, sessionId), "target", { action: "detached", target_session: sessionId });
+});
 
 function monOnEvent(source, method, p) {
   const tabId = source.tabId;
   const s = monSessions.get(tabId);
-  if (method.startsWith("Target.")) {
-    monOnTarget(tabId, s, method, p);
-    return;
-  }
-  if (!s) return;
+  if (!s || method.startsWith("Target.")) return;
   const c = monContext(tabId, s, source.sessionId || null);
   if (method.startsWith("Network.")) monOnNetwork(c, method, p);
   else monOnPage(c, method, p);
@@ -348,20 +326,10 @@ async function monEnableDomains(tabId) {
     if (domain !== "Network") await cdp(tabId, `${domain}.enable`, {});
     state.enabledDomains.add(domain);
   }
-  await cdp(tabId, "Target.setAutoAttach", MON_AUTO_ATTACH);
-}
-
-/// Apaga el auto-attach y suelta las sesiones hijas: sin eso, Chrome seguiria pausando cada
-/// iframe nuevo esperando a un depurador que ya no le contesta.
-async function monReleaseChildren(tabId, s) {
-  try {
-    await cdp(tabId, "Target.setAutoAttach", { autoAttach: false, waitForDebuggerOnStart: false, flatten: true });
-  } catch {
-    // La pestana ya no esta enganchada; no hay nada que soltar.
-  }
-  for (const sessionId of s.children.keys()) {
-    cdp(tabId, "Target.detachFromTarget", { sessionId }).catch(() => {});
-  }
+  // Los iframes nuevos llegan en pausa hasta encender su grabacion; los que ya estaban
+  // enganchados se encienden aqui mismo.
+  await framesSetPause(tabId, true);
+  for (const sessionId of frameState(tabId).sessions.keys()) await monEnableChild(tabId, sessionId);
 }
 
 function monText(text) {
@@ -377,7 +345,7 @@ const monToolHandlers = {
     }
     const session = monSessionName(tabId);
     const tab = await chrome.tabs.get(tabId);
-    monSessions.set(tabId, { session, seq: 0, section: null, requests: new Map(), children: new Map(), backlog: [] });
+    monSessions.set(tabId, { session, seq: 0, section: null, requests: new Map(), backlog: [] });
     monWrite(tabId, "session", { action: "start", url: tab.url, title: tab.title, file: monPath(session) });
     try {
       await monEnableDomains(tabId);
@@ -402,8 +370,9 @@ const monToolHandlers = {
     const { tabId } = args;
     const s = monSessions.get(tabId);
     if (!s) return monText(`No se esta grabando la pestana ${tabId}.`);
-    await monReleaseChildren(tabId, s);
     monEndSession(tabId, "detenido");
+    // Los iframes nuevos ya no se pausan; siguen enganchados para que las tools los alcancen.
+    await framesSetPause(tabId, false).catch(() => {});
     return monText(`Grabacion detenida. Archivo: ${monPath(s.session)}`);
   },
 };

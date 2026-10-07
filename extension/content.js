@@ -416,7 +416,9 @@
   }
 
   // --- Message handler ---
-  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  // Dentro de un iframe de otro dominio este archivo se inyecta por CDP en un mundo aislado,
+  // donde no existe chrome.runtime; ahi solo se usa window.__unblockedChrome (ver frames.js).
+  if (globalThis.chrome?.runtime?.onMessage) chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg.type === "generateAccessibilityTree") {
       const result = generateAccessibilityTree(msg.options || {});
       sendResponse({ result });

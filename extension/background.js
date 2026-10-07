@@ -1103,8 +1103,9 @@ const toolHandlers = {
   },
 };
 
-// Monitor de pagina (monitor_*): vive aparte y se cuelga de toolHandlers al cargarse.
-importScripts("page-monitor.js");
+// Iframes (frames.js) y monitor de pagina (page-monitor.js): viven aparte y se cuelgan de
+// toolHandlers al cargarse. frames.js va primero porque el monitor usa su registro.
+importScripts("frames.js", "page-monitor.js");
 
 // --- Tool dispatch ---
 async function handleToolRequest(id, tool, args) {
