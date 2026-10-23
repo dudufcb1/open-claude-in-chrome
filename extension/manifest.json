@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "automaton",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Control del navegador para automaton: pestañas, páginas, red y consola por CDP.",
   "minimum_chrome_version": "116",
   "permissions": [
