@@ -506,7 +506,10 @@ const server = new McpServer({
 server.tool(
   "tabs_context_mcp",
   "Get context information about the current MCP tab group. Returns all tab IDs inside the group if it exists. CRITICAL: You must get the context at least once before using other browser automation tools so you know what tabs exist. Each new conversation should create its own new tab (using tabs_create_mcp) rather than reusing existing tabs, unless the user explicitly asks to use an existing tab.",
-  { createIfEmpty: z.boolean().optional().describe("Creates a new MCP tab group if none exists, creates a new Window with a new tab group containing an empty tab (which can be used for this conversation). If a MCP tab group already exists, this parameter has no effect.") },
+  {
+    createIfEmpty: z.boolean().optional().describe("Creates a new MCP tab group if none exists, creates a new Window with a new tab group containing an empty tab (which can be used for this conversation). If a MCP tab group already exists, this parameter has no effect."),
+    incognito: z.boolean().optional().describe("true: usa (o crea) el grupo de una ventana de incógnito; false: el de una ventana normal. Si no se pasa, se queda con el grupo actual. Incógnito requiere 'Permitir en modo incógnito' en chrome://extensions."),
+  },
   async (args) => callTool("tabs_context_mcp", args)
 );
 
@@ -514,8 +517,29 @@ server.tool(
 server.tool(
   "tabs_create_mcp",
   "Creates a new empty tab in the MCP tab group. CRITICAL: You must get the context using tabs_context_mcp at least once before using other browser automation tools so you know what tabs exist.",
-  {},
+  {
+    incognito: z.boolean().optional().describe("true: crea la pestaña en una ventana de incógnito (la abre si no hay); false: en una ventana normal. Si no se pasa, en la ventana del grupo actual."),
+  },
   async (args) => callTool("tabs_create_mcp", args)
+);
+
+// 2b. tabs_list_all — todas las pestañas abiertas, no solo las del grupo
+server.tool(
+  "tabs_list_all",
+  "Lista TODAS las pestañas abiertas del navegador (no solo las del grupo MCP), con ventana, si son de incógnito, si están activas y si ya están enganchadas. Úsala cuando el usuario quiere trabajar sobre una pestaña que ya tiene abierta; después engánchala con tabs_attach.",
+  {},
+  async (args) => callTool("tabs_list_all", args)
+);
+
+// 2c. tabs_attach — enganchar una pestaña existente sin recargarla
+server.tool(
+  "tabs_attach",
+  "Engancha una pestaña que el usuario ya tiene abierta (de tabs_list_all) para que las demás tools operen sobre ella. No la recarga ni navega: conserva su estado (sesión, formularios a medias, pasos ya hechos). La mete a un grupo 'Chrome' de su propia ventana, normal o de incógnito.",
+  {
+    tabId: z.number().describe("Tab ID de tabs_list_all."),
+    force: z.boolean().optional().describe("Si la pestaña está en un grupo propio del usuario, engancharla la saca de ese grupo. Solo con true lo hace."),
+  },
+  async (args) => callTool("tabs_attach", args)
 );
 
 // 3. navigate

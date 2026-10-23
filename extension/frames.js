@@ -412,7 +412,7 @@ async function frameFormInput(args) {
 /// en uno del mismo proceso, en el mundo aislado (ve el DOM, no las variables de la pagina).
 async function frameJavascript(args) {
   if (!args.frame) return frameOriginal.javascript_tool(args);
-  if (!(await isInGroup(args.tabId))) return frameText(`Tab ${args.tabId} is not in the MCP group. Usa tabs_context_mcp para ver las pestañas del grupo o crear una.`);
+  if (!(await isInGroup(args.tabId))) return frameText(`Tab ${args.tabId} is not in the MCP group. Usa tabs_context_mcp para ver las pestañas del grupo o tabs_attach para enganchar una que ya esté abierta.`);
   const frames = await framesList(args.tabId);
   const wanted = String(args.frame);
   const rec = frames.find((r) => `f${r.n}` === wanted) || frames.find((r) => r.url.includes(wanted));
