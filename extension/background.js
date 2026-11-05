@@ -996,10 +996,10 @@ const toolHandlers = {
   },
 };
 
-// Iframes (frames.js), monitor de pagina (page-monitor.js) y grupos de pestanas (tab-groups.js):
-// viven aparte y se cuelgan de toolHandlers al cargarse. frames.js va primero porque el monitor
-// usa su registro.
-importScripts("frames.js", "page-monitor.js", "tab-groups.js");
+// Iframes (frames.js), monitor de pagina (page-monitor.js), grupos de pestanas (tab-groups.js) y
+// tutor (tutor.js): viven aparte y se cuelgan de toolHandlers al cargarse. frames.js va primero
+// porque el monitor usa su registro.
+importScripts("frames.js", "page-monitor.js", "tab-groups.js", "tutor.js");
 
 // --- Tool dispatch ---
 async function handleToolRequest(id, tool, args) {
