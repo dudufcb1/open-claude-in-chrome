@@ -15,7 +15,7 @@ let tabGroupTabs = new Set();
 const attachedTabs = new Map(); // tabId -> { enabledDomains: Set }
 const consoleMessages = new Map(); // tabId -> [{level, text, timestamp, url}]
 const networkRequests = new Map(); // tabId -> [{url, method, status, type, timestamp}]
-const screenshotStore = new Map(); // imageId -> base64
+const screenshotStore = new Map(); // imageId -> { base64, format }; upload_image las reutiliza
 
 // --- Keep-alive alarm ---
 chrome.alarms.create("keepalive", { periodInMinutes: 0.4 });
@@ -246,8 +246,14 @@ async function resolveRefToCoordinates(tabId, ref) {
 const MAX_SCREENSHOT_WIDTH = 1280;
 const MAX_SCREENSHOT_HEIGHT = 800;
 
-async function takeScreenshot(tabId, lossless = false) {
+/// store=false no la guarda para upload_image (los cuadros del GIF no deben desplazar las capturas
+/// del agente). La capa visual (overlay.js) se esconde mientras se captura.
+async function takeScreenshot(tabId, lossless = false, store = true) {
   await ensureAttached(tabId);
+  return overlayHiddenDuring(tabId, () => captureViewport(tabId, lossless, store));
+}
+
+async function captureViewport(tabId, lossless, store) {
 
   // With deviceScaleFactor: 1 set in ensureAttached, screenshots are captured
   // at CSS pixel dimensions (e.g., 1080x746), matching the coordinate space
@@ -277,15 +283,45 @@ async function takeScreenshot(tabId, lossless = false) {
     base64 = smaller.data;
   }
 
+  const format = lossless ? "png" : "jpeg";
+  if (!store) return { base64, imageId: null, format };
   const imageId = `screenshot_${Date.now()}`;
-  screenshotStore.set(imageId, base64);
+  screenshotStore.set(imageId, { base64, format });
   // Keep only last 10 screenshots (less memory pressure)
   const keys = Array.from(screenshotStore.keys());
   while (keys.length > 10) {
     screenshotStore.delete(keys.shift());
   }
 
-  return { base64, imageId, format: lossless ? "png" : "jpeg" };
+  return { base64, imageId, format };
+}
+
+/// computer zoom: recorta [x0, y0, x1, y1] del viewport con CDP (clip) y lo devuelve a escala
+/// `scale` (1 por omision). Las coordenadas de los clics siguientes siguen siendo las de la pestana.
+async function zoomRegion(tabId, region, scale = 1) {
+  const [x0, y0, x1, y1] = region.map(Number);
+  const width = x1 - x0;
+  const height = y1 - y0;
+  if (!(width > 0 && height > 0)) return { content: [{ type: "text", text: "zoom: region debe ser [x0, y0, x1, y1] con x1 > x0 y y1 > y0." }], isError: true };
+  const factor = Number(scale) > 0 ? Math.min(Number(scale), 4) : 1;
+  await ensureAttached(tabId);
+  // El clip de CDP se mide desde el inicio del documento, no del viewport: se suma el scroll actual.
+  const offset = await cdp(tabId, "Runtime.evaluate", {
+    expression: "[window.visualViewport.pageLeft, window.visualViewport.pageTop]",
+    returnByValue: true,
+  });
+  const [scrollX, scrollY] = offset?.result?.value || [0, 0];
+  const shot = await overlayHiddenDuring(tabId, () => cdp(tabId, "Page.captureScreenshot", {
+    format: "png",
+    clip: { x: x0 + scrollX, y: y0 + scrollY, width, height, scale: factor },
+    captureBeyondViewport: false,
+  }));
+  return {
+    content: [
+      { type: "text", text: `Zoom de [${region.join(", ")}] a escala ${factor} (${Math.round(width * factor)}x${Math.round(height * factor)})` },
+      { type: "image", data: shot.data, mimeType: "image/png" },
+    ],
+  };
 }
 
 // --- Mouse helpers ---
@@ -305,6 +341,7 @@ async function mouseClick(tabId, x, y, opts = {}) {
   const clickCount = opts.clickCount || 1;
   const modifiers = opts.modifiers || 0;
 
+  await overlayPoint(tabId, x, y, true); // La flecha visible llega antes que el clic real
   await dispatchMouse(tabId, "mouseMoved", x, y, { modifiers });
   await sleep(50);
   await dispatchMouse(tabId, "mousePressed", x, y, { button, clickCount, modifiers });
@@ -592,6 +629,7 @@ const toolHandlers = {
 
       case "hover": {
         if (!coordinate) return { content: [{ type: "text", text: "coordinate is required for hover" }] };
+        await overlayPoint(tabId, coordinate[0], coordinate[1]);
         await dispatchMouse(tabId, "mouseMoved", coordinate[0], coordinate[1], { modifiers });
         await sleep(200);
         return { content: [{ type: "text", text: `Hovered at (${coordinate[0]}, ${coordinate[1]})` }] };
@@ -643,6 +681,7 @@ const toolHandlers = {
         const amount = Math.min(args.scroll_amount || 3, 10);
         const deltaX = dir === "left" ? -amount * 100 : dir === "right" ? amount * 100 : 0;
         const deltaY = dir === "up" ? -amount * 100 : dir === "down" ? amount * 100 : 0;
+        await overlayPoint(tabId, coordinate[0], coordinate[1]);
         await cdp(tabId, "Input.dispatchMouseEvent", {
           type: "mouseWheel",
           x: coordinate[0],
@@ -691,10 +730,12 @@ const toolHandlers = {
         }
         const [sx, sy] = args.start_coordinate;
         const [ex, ey] = coordinate;
+        await overlayPoint(tabId, sx, sy, true);
         await dispatchMouse(tabId, "mouseMoved", sx, sy, { modifiers });
         await sleep(50);
         await dispatchMouse(tabId, "mousePressed", sx, sy, { button: "left", modifiers });
         await sleep(50);
+        const travel = overlayPoint(tabId, ex, ey); // La flecha acompana el arrastre mientras corre
         // Move in steps
         const steps = 10;
         for (let i = 1; i <= steps; i++) {
@@ -704,6 +745,7 @@ const toolHandlers = {
           await sleep(20);
         }
         await dispatchMouse(tabId, "mouseReleased", ex, ey, { button: "left", modifiers });
+        await travel;
         return { content: [{ type: "text", text: `Dragged from (${sx}, ${sy}) to (${ex}, ${ey})` }] };
       }
 
@@ -711,15 +753,7 @@ const toolHandlers = {
         if (!args.region || args.region.length !== 4) {
           return { content: [{ type: "text", text: "region [x0, y0, x1, y1] is required for zoom" }] };
         }
-        // Capture full screenshot then crop region
-        const { base64: fullBase64 } = await takeScreenshot(tabId);
-        // Return the full screenshot with region info — client can crop
-        return {
-          content: [
-            { type: "text", text: `Zoom region: [${args.region.join(", ")}]` },
-            { type: "image", data: fullBase64, mimeType: "image/png" },
-          ],
-        };
+        return zoomRegion(tabId, args.region, args.scale);
       }
 
       default:
@@ -935,51 +969,6 @@ const toolHandlers = {
     return { content: [{ type: "text", text: `Resized window to ${width}x${height}` }] };
   },
 
-  async upload_image(args) {
-    const { imageId, tabId, ref, coordinate, filename = "image.png" } = args;
-    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group. Usa tabs_context_mcp para ver las pestañas del grupo o tabs_attach para enganchar una que ya esté abierta.` }] };
-
-    const base64 = screenshotStore.get(imageId);
-    if (!base64) {
-      return { content: [{ type: "text", text: `Image ${imageId} not found. Take a screenshot first.` }] };
-    }
-
-    // Use CDP to set file input
-    if (ref) {
-      // Find the element and set its files via CDP
-      await ensureAttached(tabId);
-      const result = await cdp(tabId, "Runtime.evaluate", {
-        expression: `(() => {
-          const el = window.__unblockedChrome?.resolveRef?.("${ref}");
-          if (!el) return null;
-          return el.tagName.toLowerCase();
-        })()`,
-        returnByValue: true,
-      });
-
-      if (result.result?.value === "input") {
-        // For file inputs, we need DOM.setFileInputFiles via CDP
-        // First get the node
-        const doc = await cdp(tabId, "DOM.getDocument", {});
-        const nodeResult = await cdp(tabId, "Runtime.evaluate", {
-          expression: `(() => {
-            const el = window.__unblockedChrome?.resolveRef?.("${ref}");
-            if (el) el.scrollIntoView();
-            return true;
-          })()`,
-          returnByValue: true,
-        });
-        return { content: [{ type: "text", text: `Upload via file input requires a temporary file. Use the file input directly.` }] };
-      }
-    }
-
-    return { content: [{ type: "text", text: `Image upload for ref=${ref}, coordinate=${coordinate} — use drag & drop or file input.` }] };
-  },
-
-  async gif_creator(args) {
-    return { content: [{ type: "text", text: "GIF recording is not yet implemented in this extension." }] };
-  },
-
   async shortcuts_list(args) {
     return { content: [{ type: "text", text: "No shortcuts available. Shortcuts are not supported in this extension." }] };
   },
@@ -1004,24 +993,44 @@ const toolHandlers = {
 };
 
 // Iframes (frames.js), monitor de pagina (page-monitor.js), grupos de pestanas (tab-groups.js),
-// recarga remota (self-reload.js), tutor (tutor.js) y reproductor de recorridos (recorridos.js): viven
-// aparte y se cuelgan de toolHandlers al cargarse. frames.js va primero porque el monitor usa su
-// registro, y recorridos.js va despues de tutor.js porque usa su buscador.
-importScripts("frames.js", "page-monitor.js", "tab-groups.js", "self-reload.js", "tutor.js", "recorridos.js");
+// recarga remota (self-reload.js), tutor (tutor.js), reproductor de recorridos (recorridos.js), capa
+// visual con cursor y Detener (overlay.js), subida de archivos (uploads.js), lotes (batch.js) y
+// grabacion del GIF (gif-recorder.js): viven aparte y se cuelgan de toolHandlers al cargarse.
+// frames.js va primero porque el monitor y las subidas usan su registro, y recorridos.js va despues
+// de tutor.js porque usa su buscador.
+importScripts(
+  "frames.js", "page-monitor.js", "tab-groups.js", "self-reload.js", "tutor.js", "recorridos.js",
+  "overlay.js", "uploads.js", "batch.js", "gif-recorder.js",
+);
 
 // --- Tool dispatch ---
-async function handleToolRequest(id, tool, args) {
-  const handler = toolHandlers[tool];
-  if (!handler) {
-    sendError(id, `Unknown tool: ${tool}`);
-    return;
-  }
 
+/// Corre una tool como lo hace una llamada del puente; browser_batch usa el mismo camino por paso.
+/// Si el usuario pico Detener en la pestana, la tool que la opera no corre y devuelve el aviso.
+async function runTool(tool, args) {
+  const handler = toolHandlers[tool];
+  if (!handler) throw new Error(`Unknown tool: ${tool}`);
+  if (typeof args?.tabId === "number" && OVERLAY_ACTIVITY_TOOLS.has(tool) && overlayConsumeStop(args.tabId)) {
+    return {
+      content: [{ type: "text", text: `Detenido: el usuario pico Detener en la pestana ${args.tabId}, asi que ${tool} no se ejecuto. Pregunta antes de seguir.` }],
+      isError: true,
+    };
+  }
+  await overlayActivityStart(tool, args);
   try {
     const result = await handler(args);
-    sendResponse(id, result);
+    await gifAfterTool(tool, args, result).catch(() => {});
+    return result;
+  } finally {
+    overlayActivityEnd(tool, args).catch(() => {});
+  }
+}
+
+async function handleToolRequest(id, tool, args) {
+  try {
+    sendResponse(id, await runTool(tool, args));
   } catch (err) {
-    sendError(id, `${tool} failed: ${err.message}`);
+    sendError(id, err.message.startsWith("Unknown tool") ? err.message : `${tool} failed: ${err.message}`);
   }
 }
 

@@ -324,3 +324,22 @@ toolHandlers.tabs_attach = async function (args) {
   result.content[0].text = `Pestaña ${tabId} enganchada (${kind}), sin recargar.\n\n` + result.content[0].text;
   return result;
 };
+
+/// Cierra una pestana del grupo cuando ya no se ocupa. Una pestana enganchada con tabs_attach es
+/// del usuario: no se cierra, solo sale del grupo y queda abierta como estaba. Si era la ultima de
+/// su ventana, se deja una pestana nueva para no tumbar el navegador.
+toolHandlers.tabs_close_mcp = async function (args) {
+  const { tabId } = args;
+  if (!Number.isInteger(tabId)) return { content: [{ type: "text", text: "tabs_close_mcp: tabId debe ser un entero." }], isError: true };
+  if (!(await isInGroup(tabId))) {
+    return { content: [{ type: "text", text: `Tab ${tabId} no esta en el grupo; no se cerro nada. Usa tabs_context_mcp para ver las del grupo.` }], isError: true };
+  }
+  const tab = await chrome.tabs.get(tabId);
+  tabGroupTabs.delete(tabId);
+  if ((await getAttachedTabIds()).has(tabId)) {
+    await chrome.tabs.ungroup([tabId]);
+    return { content: [{ type: "text", text: `Tab ${tabId} era del usuario (tabs_attach): salio del grupo y sigue abierta.` }] };
+  }
+  await closeTabsKeepingWindow(tab.windowId, [tabId]);
+  return { content: [{ type: "text", text: `Tab ${tabId} cerrada.` }] };
+};
