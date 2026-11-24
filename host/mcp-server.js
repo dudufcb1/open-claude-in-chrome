@@ -572,7 +572,7 @@ server.tool(
     url: z.string().describe("URL del archivo a descargar. Se baja con la sesion del tabId dado (cookies)."),
     tabId: z.number().describe("Tab ID (del grupo MCP) cuya sesion se usa para bajar la URL. Debe estar logueado en el sitio."),
     filename: z.string().optional().describe("Nombre del archivo final (ej. 'devactivo-img.png'). Si se omite usa 'download'."),
-    downloadDir: z.string().optional().describe("Carpeta absoluta destino. Default: /home/edu/Descargas."),
+    downloadDir: z.string().optional().describe("Carpeta absoluta destino. Default: /home/edugoat/Descargas."),
   },
   async (args) => callTool("download_url", args)
 );

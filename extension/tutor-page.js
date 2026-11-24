@@ -442,7 +442,10 @@
     host?.remove();
   }
 
-  window.__tutor = { activate, deactivate, locate, point, pointArea, clear };
+  /// Elemento encontrado por el ultimo locate(); lo usa el reproductor de recorridos (recorridos-page.js).
+  const candidate = (index) => (candidates[index]?.isConnected ? candidates[index] : null);
+
+  window.__tutor = { activate, deactivate, locate, point, pointArea, clear, candidate };
 
   // Frame nuevo durante una clase (lo inyecta el registro dinamico): pregunta si le toca escuchar.
   try {

@@ -458,7 +458,7 @@ const toolHandlers = {
     if (!tabId) return { content: [{ type: "text", text: "download_url: falta 'tabId' (el tab cuya sesion se usa para bajar la URL)." }] };
     if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} no esta en el grupo MCP.` }] };
 
-    const dir = args.downloadDir || "/home/edu/Descargas";
+    const dir = args.downloadDir || "/home/edugoat/Descargas";
     const fn = (filename || "download").replace(/['"\\]/g, "");
     await ensureAttached(tabId);
 
@@ -906,6 +906,13 @@ const toolHandlers = {
     return { content: [{ type: "text", text: `Network requests (${reqs.length}):\n${text}` }] };
   },
 
+  // Deja una pestaña al frente de su ventana sin enfocar la ventana ni engancharla al grupo: es para mirarla.
+  async tabs_show(args) {
+    const { tabId } = args;
+    await chrome.tabs.update(tabId, { active: true });
+    return { content: [{ type: "text", text: `Tab ${tabId} visible` }] };
+  },
+
   async tabs_activate(args) {
     const { tabId } = args;
     if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group. Usa tabs_context_mcp para ver las pestañas del grupo o tabs_attach para enganchar una que ya esté abierta.` }] };
@@ -996,10 +1003,11 @@ const toolHandlers = {
   },
 };
 
-// Iframes (frames.js), monitor de pagina (page-monitor.js), grupos de pestanas (tab-groups.js) y
-// tutor (tutor.js): viven aparte y se cuelgan de toolHandlers al cargarse. frames.js va primero
-// porque el monitor usa su registro.
-importScripts("frames.js", "page-monitor.js", "tab-groups.js", "tutor.js");
+// Iframes (frames.js), monitor de pagina (page-monitor.js), grupos de pestanas (tab-groups.js),
+// recarga remota (self-reload.js), tutor (tutor.js) y reproductor de recorridos (recorridos.js): viven
+// aparte y se cuelgan de toolHandlers al cargarse. frames.js va primero porque el monitor usa su
+// registro, y recorridos.js va despues de tutor.js porque usa su buscador.
+importScripts("frames.js", "page-monitor.js", "tab-groups.js", "self-reload.js", "tutor.js", "recorridos.js");
 
 // --- Tool dispatch ---
 async function handleToolRequest(id, tool, args) {
