@@ -29,25 +29,59 @@ async function rememberAttachedTab(tabId) {
   try { await chrome.storage.session.set({ [ATTACHED_KEY]: [...ids] }); } catch {}
 }
 
-/// Evita acumulacion infinita de grupos huerfanos de sesiones viejas. Solo si ya hay mas de
-/// MAX_MCP_GROUPS grupos nuestros se cierran TODOS antes de abrir el nuevo. El umbral evita
-/// reventar grupos donde otra instancia siga trabajando. Las pestanas enganchadas con
-/// tabs_attach son del usuario y nunca se cierran.
-async function pruneOrphanGroups() {
-  const MAX_MCP_GROUPS = 5;
-  try {
-    const ours = (await chrome.tabGroups.query({})).filter((g) => OUR_GROUP_TITLES.has(g.title));
-    if (ours.length <= MAX_MCP_GROUPS) return;
-    const attached = await getAttachedTabIds();
-    for (const g of ours) {
-      const gtabs = await chrome.tabs.query({ groupId: g.id });
-      const ids = gtabs.map((t) => t.id).filter((id) => id != null && !attached.has(id));
-      if (ids.length) { try { await chrome.tabs.remove(ids); } catch {} }
-    }
-    tabGroupId = null;
-    tabGroupTabs.clear();
-  } catch {}
+const MAX_OUR_GROUPS = 2;
+
+async function ourOpenGroups() {
+  return (await chrome.tabGroups.query({})).filter((g) => OUR_GROUP_TITLES.has(g.title));
 }
+
+/// Cierra pestanas de una ventana sin cerrar la ventana: si se iban todas, deja una nueva. Asi
+/// limpiar nunca tumba el navegador cuando esa era su unica ventana.
+async function closeTabsKeepingWindow(windowId, tabIds) {
+  const inWindow = await chrome.tabs.query({ windowId });
+  if (inWindow.length <= tabIds.length) await chrome.tabs.create({ windowId, active: true });
+  await chrome.tabs.remove(tabIds);
+}
+
+/// Quita todos nuestros grupos abiertos. Las pestanas enganchadas con tabs_attach son del usuario:
+/// se quedan abiertas y solo salen del grupo, para que tampoco quede su chip. Las demas se cierran.
+///
+/// Solo alcanza grupos ABIERTOS: los chips que Chrome deja en la barra de favoritos cuando se cierra
+/// el navegador con un grupo abierto ya no existen para esta API, ni se pueden borrar desde aqui.
+async function clearOurGroups() {
+  const groups = await ourOpenGroups();
+  const attached = await getAttachedTabIds();
+  for (const group of groups) {
+    const tabs = await chrome.tabs.query({ groupId: group.id });
+    const keep = tabs.filter((t) => attached.has(t.id)).map((t) => t.id);
+    const close = tabs.filter((t) => !attached.has(t.id)).map((t) => t.id);
+    try {
+      if (keep.length) await chrome.tabs.ungroup(keep);
+      if (close.length) await closeTabsKeepingWindow(group.windowId, close);
+    } catch {
+      // La pestana se pudo cerrar mientras tanto; se sigue con los demas grupos.
+    }
+  }
+  tabGroupId = null;
+  tabGroupTabs.clear();
+  return groups.length;
+}
+
+/// Candado: con mas de MAX_OUR_GROUPS grupos nuestros se cierran TODOS antes de abrir el nuevo. Si
+/// otra sesion seguia trabajando en uno, pierde su pestana: es lo que se decidio a cambio de que no
+/// se acumulen; esa sesion se recupera sola pidiendo otra.
+async function pruneOrphanGroups() {
+  try {
+    if ((await ourOpenGroups()).length > MAX_OUR_GROUPS) await clearOurGroups();
+  } catch {
+    // Limpiar es un extra: si falla, igual se abre el grupo nuevo.
+  }
+}
+
+// Picarle al icono de la extension limpia los grupos.
+chrome.action.onClicked.addListener(() => {
+  clearOurGroups().catch(() => {});
+});
 
 async function ensureTabGroup(createIfEmpty) {
   if (tabGroupId !== null) {
@@ -275,6 +309,7 @@ toolHandlers.tabs_attach = async function (args) {
       await chrome.tabs.group({ tabIds: [tabId], groupId: sameWindowGroup.id });
       tabGroupId = sameWindowGroup.id;
     } else {
+      await pruneOrphanGroups();
       const groupId = await chrome.tabs.group({ tabIds: [tabId], createProperties: { windowId: tab.windowId } });
       await chrome.tabGroups.update(groupId, { title: "Chrome", color: tab.incognito ? "grey" : "blue" });
       tabGroupId = groupId;

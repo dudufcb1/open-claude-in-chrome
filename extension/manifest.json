@@ -19,6 +19,9 @@
   "host_permissions": [
     "<all_urls>"
   ],
+  "action": {
+    "default_title": "Limpiar grupos de pestañas"
+  },
   "background": {
     "service_worker": "background.js"
   },
