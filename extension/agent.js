@@ -19,42 +19,10 @@ const AGENT_INSTRUCTIONS = `Controlas una pestana de Chrome para cumplir la tare
   irreversible que la tarea no pidio, termina con finish(success=false) y explica que falta.
 - Cuando acabes, llama finish con un resumen corto en espanol de lo que hiciste.`;
 
-let agentRun = null; // { id, tabId, task, cancelled, state, log[] }
+let agentRun = null; // { id, tabId, task, mode, cancelled, abort, state, log[], steps[], usage, result }
 const agentPorts = new Set();
 
-/// Historia de la conversacion. La captura solo se manda en la vuelta que sigue a la accion que la
-/// produjo; despues queda un resumen en texto, para no pagar miles de tokens por imagenes viejas.
-class AgentConversation {
-  constructor(task, firstView) {
-    this.history = [{ role: "user", content: [{ type: "input_text", text: `Tarea: ${task}` }] }];
-    this.view = firstView;
-  }
-
-  forModel() {
-    if (!this.view) return this.history;
-    const view = this.view;
-    this.view = null;
-    return [...this.history, { role: "user", content: [{ type: "input_text", text: "Pantalla actual:" }, ...view] }];
-  }
-
-  addModelOutput(items) {
-    this.history.push(...items);
-  }
-
-  addUserText(text) {
-    this.history.push({ role: "user", content: [{ type: "input_text", text }] });
-  }
-
-  addToolResult(callId, output) {
-    if (Array.isArray(output)) {
-      const text = output.filter((p) => p.type === "input_text").map((p) => p.text).join("\n");
-      this.history.push({ type: "function_call_output", call_id: callId, output: `${text}\n(La pantalla nueva va en el siguiente mensaje.)` });
-      this.view = output;
-    } else {
-      this.history.push({ type: "function_call_output", call_id: callId, output });
-    }
-  }
-}
+// La historia de la conversacion (AgentConversation) y la memoria por pestana viven en agent-memory.js.
 
 function agentBroadcast(message) {
   for (const port of agentPorts) {
@@ -77,8 +45,8 @@ function agentSetState(state, extra = {}) {
 
 function agentSnapshot() {
   if (!agentRun) return null;
-  const { id, tabId, task, state, log, result } = agentRun;
-  return { id, tabId, task, state, log, result: result || null };
+  const { id, tabId, task, state, log, result, usage } = agentRun;
+  return { id, tabId, task, state, log, result: result || null, usage };
 }
 
 /// Descripcion corta de una llamada para el registro del panel.
@@ -116,13 +84,16 @@ function agentUntilCancelled(run, promise) {
 }
 
 async function agentLoop(run, settings) {
-  const sessionId = agentNewSessionId();
-  const conversation = new AgentConversation(run.task, await agentLook(run.tabId));
+  const mem = await agentMemoryGet(run.tabId);
+  const previous = run.mode === "continue" ? mem.tasks : [];
+  if (previous.length) agentLog("info", `Continúa con el contexto de ${previous.length} tarea(s) anterior(es).`);
+  const conversation = new AgentConversation(agentFirstMessage(run.task, previous), await agentLook(run.tabId));
   let nudges = 0;
   for (let turn = 1; turn <= AGENT_MAX_TURNS; turn++) {
     if (run.cancelled) return { success: false, summary: "Detenido por el usuario." };
     agentLog("thinking", `Vuelta ${turn}`);
-    const reply = await agentCallModel(settings, sessionId, run.id, AGENT_INSTRUCTIONS, conversation.forModel(), AGENT_TOOL_SPECS, run.abort.signal);
+    const reply = await agentCallModel(settings, mem.sessionId, run.id, AGENT_INSTRUCTIONS, conversation.forModel(), AGENT_TOOL_SPECS, run.abort.signal);
+    agentAddUsage(run.usage, reply.usage);
     conversation.addModelOutput(reply.items);
     if (reply.text) agentLog("say", reply.text);
     if (!reply.calls.length) {
@@ -132,25 +103,32 @@ async function agentLoop(run, settings) {
     }
     for (const call of reply.calls) {
       if (run.cancelled) return { success: false, summary: "Detenido por el usuario." };
-      agentLog("action", agentDescribeCall(call));
+      const step = agentDescribeCall(call);
+      agentLog("action", step);
+      if (call.name !== "finish") run.steps.push(step);
       const out = await agentUntilCancelled(run, agentExecute(run.tabId, call)).catch((e) => ({ output: `Error: ${e.message}` }));
       if (run.cancelled) return { success: false, summary: "Detenido por el usuario." };
       if (out.finished) return out.finished;
       if (out.stopped) return { success: false, summary: "Detenido desde el boton de la pagina." };
       conversation.addToolResult(call.callId, out.output);
       const text = Array.isArray(out.output) ? out.output.find((p) => p.type === "input_text")?.text : out.output;
-      if (text) agentLog("result", text.slice(0, 300));
+      if (text) agentLog("result", text.slice(0, 1500));
     }
   }
   return { success: false, summary: `Se agotaron las ${AGENT_MAX_TURNS} vueltas sin terminar.` };
 }
 
-async function agentStart(tabId, task) {
+/// mode: "new" olvida lo que se hizo antes en la pestana; "continue" lo trae como contexto.
+async function agentStart(tabId, task, mode) {
   if (agentRun?.state === "running") return "Ya hay una tarea corriendo; detenla primero.";
   const settings = await agentLoadSettings();
   if (!settings.token) return "Falta el token del backend. Ponlo en Ajustes.";
   if (!task.trim()) return "Escribe que quieres que haga.";
-  agentRun = { id: crypto.randomUUID(), tabId, task: task.trim(), cancelled: false, abort: new AbortController(), state: "running", log: [] };
+  if (mode !== "continue") await agentMemoryForget(tabId);
+  agentRun = {
+    id: crypto.randomUUID(), tabId, task: task.trim(), mode, cancelled: false, abort: new AbortController(),
+    state: "running", log: [], steps: [], usage: { turns: 0, input: 0, cached: 0, output: 0, cost: 0 },
+  };
   const run = agentRun;
   agentSetState("running");
   const tabError = await agentPrepareTab(tabId);
@@ -162,7 +140,9 @@ async function agentStart(tabId, task) {
   agentLoop(run, settings)
     .then((result) => { run.result = result; })
     .catch((e) => { run.result = { success: false, summary: run.cancelled ? "Detenido por el usuario." : e.message }; })
-    .finally(() => {
+    .finally(async () => {
+      await agentMemoryRemember(tabId, { task: run.task, success: run.result.success, summary: run.result.summary, steps: run.steps })
+        .catch(() => {});
       if (agentRun === run) agentSetState("done");
     });
   return null;
@@ -175,8 +155,11 @@ chrome.runtime.onConnect.addListener((port) => {
   agentLoadSettings().then((settings) => port.postMessage({ type: "hello", run: agentSnapshot(), settings }));
   port.onMessage.addListener(async (msg) => {
     if (msg.type === "start") {
-      const error = await agentStart(msg.tabId, String(msg.task || ""));
+      const error = await agentStart(msg.tabId, String(msg.task || ""), msg.mode === "continue" ? "continue" : "new");
       if (error) port.postMessage({ type: "error", text: error });
+    } else if (msg.type === "context") {
+      const mem = await agentMemoryGet(msg.tabId).catch(() => ({ tasks: [] }));
+      port.postMessage({ type: "context", tabId: msg.tabId, tasks: mem.tasks.map((t) => t.task) });
     } else if (msg.type === "stop" && agentRun?.state === "running") {
       agentRun.cancelled = true;
       agentRun.abort.abort();

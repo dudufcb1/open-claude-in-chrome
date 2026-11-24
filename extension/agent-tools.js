@@ -79,7 +79,8 @@ async function agentExecute(tabId, call) {
     case "screenshot":
       return { output: await agentLook(tabId) };
     case "read_page":
-      result = await runTool("read_page", { tabId, filter: a.filter === "all" ? "all" : "interactive" });
+      // max_chars: un arbol gigante entra a la historia y se paga en cada vuelta siguiente.
+      result = await runTool("read_page", { tabId, filter: a.filter === "all" ? "all" : "interactive", max_chars: AGENT_OUTPUT_MAX_CHARS });
       break;
     case "find":
       result = await runTool("find", { tabId, query: String(a.query || "") });

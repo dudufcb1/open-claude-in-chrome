@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="es" data-theme="linear">
+<html lang="es" data-theme="notion">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -9,7 +9,7 @@
 <body>
   <header class="bar">
     <span class="title">Agente</span>
-    <span id="status" class="status" data-state="idle"><i></i><span>Listo</span></span>
+    <span id="status" class="status" data-state="idle"><span>Listo</span></span>
     <button id="toggleSettings" class="ghost" type="button" aria-expanded="false">Ajustes</button>
   </header>
 
@@ -27,12 +27,14 @@
   </section>
 
   <section class="compose">
-    <textarea id="task" rows="4" placeholder="Qué quieres que haga en esta pestaña. Ej.: llena el formulario de contacto con mis datos y no lo envíes."></textarea>
+    <textarea id="task" rows="4" placeholder="¿Qué hago en esta pestaña? Por ejemplo: llena el formulario de contacto con mis datos, pero no lo envíes."></textarea>
     <div class="row">
       <span id="tabLabel" class="hint">Pestaña activa</span>
-      <button id="start" type="button" title="Ctrl+Enter">Iniciar <kbd>Ctrl ↵</kbd></button>
+      <button id="startNew" class="ghost" type="button" title="Empieza sin recordar lo anterior">Nueva tarea</button>
+      <button id="start" type="button" title="Ctrl+Enter">Continuar <kbd>Ctrl ↵</kbd></button>
       <button id="stop" class="danger" type="button" hidden>Detener</button>
     </div>
+    <p id="context" class="hint context" hidden></p>
     <p id="notice" class="notice" role="alert" hidden></p>
   </section>
 

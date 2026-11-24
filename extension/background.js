@@ -1001,7 +1001,7 @@ const toolHandlers = {
 importScripts(
   "frames.js", "page-monitor.js", "tab-groups.js", "self-reload.js", "tutor.js", "recorridos.js",
   "overlay.js", "uploads.js", "batch.js", "gif-recorder.js",
-  "agent-model.js", "agent-tools.js", "agent.js",
+  "agent-model.js", "agent-memory.js", "agent-tools.js", "agent.js",
 );
 
 // --- Tool dispatch ---

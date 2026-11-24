@@ -105,7 +105,8 @@ async function agentCallOnce(settings, sessionId, runId, payload, cancelSignal) 
 
 /// Una vuelta del modelo, con dos reintentos si el backend no contesta o falla de su lado.
 async function agentCallModel(settings, sessionId, runId, instructions, input, tools, cancelSignal) {
-  const payload = { instructions, input, tools, store: false, parallel_tool_calls: false };
+  // prompt_cache_key: misma llave que la sesion, para que el proveedor agrupe la cache de la pestana.
+  const payload = { instructions, input, tools, store: false, parallel_tool_calls: false, prompt_cache_key: sessionId };
   for (let attempt = 0; ; attempt++) {
     try {
       return await agentCallOnce(settings, sessionId, runId, payload, cancelSignal);
