@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="es" data-theme="linear">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Agente</title>
+  <link rel="stylesheet" href="panel.css">
+</head>
+<body>
+  <header class="bar">
+    <span class="title">Agente</span>
+    <span id="status" class="status" data-state="idle"><i></i><span>Listo</span></span>
+    <button id="toggleSettings" class="ghost" type="button" aria-expanded="false">Ajustes</button>
+  </header>
+
+  <section id="settings" class="settings" hidden>
+    <label>URL del backend
+      <input id="backendUrl" type="url" spellcheck="false" placeholder="http://127.0.0.1:8792">
+    </label>
+    <label>Token
+      <input id="token" type="password" spellcheck="false" autocomplete="off">
+    </label>
+    <div class="row">
+      <button id="saveSettings" type="button">Guardar</button>
+      <button id="clearGroups" class="ghost" type="button">Limpiar grupos de pestañas</button>
+    </div>
+  </section>
+
+  <section class="compose">
+    <textarea id="task" rows="4" placeholder="Qué quieres que haga en esta pestaña. Ej.: llena el formulario de contacto con mis datos y no lo envíes."></textarea>
+    <div class="row">
+      <span id="tabLabel" class="hint">Pestaña activa</span>
+      <button id="start" type="button" title="Ctrl+Enter">Iniciar <kbd>Ctrl ↵</kbd></button>
+      <button id="stop" class="danger" type="button" hidden>Detener</button>
+    </div>
+    <p id="notice" class="notice" role="alert" hidden></p>
+  </section>
+
+  <section id="result" class="result" hidden></section>
+
+  <p id="empty" class="empty">Escribe una instrucción y dale Iniciar. El agente trabaja en la pestaña que tengas al frente; aquí ves cada paso y puedes detenerlo.</p>
+  <ol id="log" class="log" aria-live="polite"></ol>
+
+  <script src="panel.js"></script>
+</body>
+</html>

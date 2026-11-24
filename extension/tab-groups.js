@@ -78,10 +78,7 @@ async function pruneOrphanGroups() {
   }
 }
 
-// Picarle al icono de la extension limpia los grupos.
-chrome.action.onClicked.addListener(() => {
-  clearOurGroups().catch(() => {});
-});
+// Limpiar los grupos ahora es un boton del panel del agente (agent.js); el icono abre el panel.
 
 async function ensureTabGroup(createIfEmpty) {
   if (tabGroupId !== null) {

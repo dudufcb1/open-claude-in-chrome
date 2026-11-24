@@ -8,6 +8,7 @@
 const OVERLAY_FILE = "overlay-page.js";
 const OVERLAY_MOVE_CAP_MS = 700; // Tope de espera por la animacion; el clic no se retrasa mas que esto
 const OVERLAY_IDLE_MS = 4000; // Sin acciones durante este tiempo, se retiran el borde y el boton
+const OVERLAY_CALL_CAP_MS = 1500; // Una llamada a la capa nunca detiene la tool mas que esto
 // Tools que operan la pagina: mientras corren se muestra el borde. Las de solo lectura no lo prenden.
 const OVERLAY_ACTIVITY_TOOLS = new Set([
   "computer", "navigate", "form_input", "javascript_tool", "file_upload", "upload_image", "browser_batch",
@@ -35,9 +36,16 @@ async function overlayTabVisible(tabId) {
 /// Llama un metodo de window.__automatonOverlay en el frame principal. Con inject, si la capa no
 /// esta la inyecta primero; sin inject, si no esta no hace nada. Devuelve lo que regrese el metodo,
 /// o null si no se llamo o la pagina no admite scripts (chrome://, la tienda, un PDF).
-async function overlayCall(tabId, method, args = [], inject = true) {
+/// injectImmediately: sin el, Chrome espera a que la pagina termine de cargar para inyectar, y en un
+/// sitio lleno de anuncios eso puede no pasar nunca (la captura se quedaba colgada).
+function overlayCall(tabId, method, args = [], inject = true) {
+  return overlayTimeout(overlayCallNow(tabId, method, args, inject), OVERLAY_CALL_CAP_MS);
+}
+
+async function overlayCallNow(tabId, method, args, inject) {
   const run = () => chrome.scripting.executeScript({
     target: { tabId, frameIds: [0] },
+    injectImmediately: true,
     func: (name, params) => (window.__automatonOverlay ? window.__automatonOverlay[name](...params) : "__missing__"),
     args: [method, args],
   });
@@ -45,7 +53,7 @@ async function overlayCall(tabId, method, args = [], inject = true) {
     let [res] = await run();
     if (res?.result === "__missing__") {
       if (!inject) return null;
-      await chrome.scripting.executeScript({ target: { tabId, frameIds: [0] }, files: [OVERLAY_FILE] });
+      await chrome.scripting.executeScript({ target: { tabId, frameIds: [0] }, files: [OVERLAY_FILE], injectImmediately: true });
       [res] = await run();
     }
     return res?.result ?? null;

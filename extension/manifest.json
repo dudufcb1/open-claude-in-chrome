@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "automaton",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "description": "Control del navegador para automaton: pestañas, páginas, red y consola por CDP.",
   "minimum_chrome_version": "116",
   "permissions": [
@@ -14,21 +14,26 @@
     "windows",
     "storage",
     "alarms",
-    "downloads"
+    "downloads",
+    "sidePanel"
   ],
   "host_permissions": [
     "<all_urls>"
   ],
   "action": {
-    "default_title": "Limpiar grupos de pestañas"
+    "default_title": "Abrir el agente"
   },
   "background": {
     "service_worker": "background.js"
   },
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
-      "js": ["content.js"],
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content.js"
+      ],
       "run_at": "document_idle",
       "all_frames": false
     }
@@ -37,5 +42,8 @@
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",
     "128": "icons/icon128.png"
+  },
+  "side_panel": {
+    "default_path": "panel.html"
   }
 }

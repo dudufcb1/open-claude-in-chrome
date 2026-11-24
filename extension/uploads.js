@@ -95,9 +95,10 @@ function uploadPageDropAt(x, y, files) {
 /// Corre fn(...args) en la pagina principal (mundo aislado, donde vive content.js con sus refs).
 async function uploadRunMain(tabId, fn, args) {
   const target = { tabId, frameIds: [0] };
-  const [probe] = await chrome.scripting.executeScript({ target, func: () => !!window.__unblockedChrome });
-  if (!probe?.result) await chrome.scripting.executeScript({ target, files: ["content.js"] });
-  const [res] = await chrome.scripting.executeScript({ target, func: fn, args });
+  // injectImmediately: no esperar a que termine de cargar una pagina que quiza nunca termina.
+  const [probe] = await chrome.scripting.executeScript({ target, func: () => !!window.__unblockedChrome, injectImmediately: true });
+  if (!probe?.result) await chrome.scripting.executeScript({ target, files: ["content.js"], injectImmediately: true });
+  const [res] = await chrome.scripting.executeScript({ target, func: fn, args, injectImmediately: true });
   return res?.result;
 }
 
